@@ -3,7 +3,7 @@
 
 
 
-bash <(curl -fsSL https://raw.githubusercontent.com/hia1321/linux-panel/main/install.sh)
+bash <(curl -fsSL "https://cdn.jsdelivr.net/gh/hia1321/linux-panel@main/install.sh?t=$(date +%s)")
 
 
 
