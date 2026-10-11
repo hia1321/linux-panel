@@ -1386,7 +1386,7 @@ try {
 } catch(e){}
 </script>
 <style>
-:root{--bg:#0e1116;--panel:#151a21;--border:#262e3a;--text:#e6eaf2;
+:root{--panel:#151a21;--border:#262e3a;--text:#e6eaf2;
   --muted:#8b95a7;--accent:#3b82f6;--accent-h:#2f6fdd;--danger:#ef4444;
   --glow:rgba(59,130,246,.35);--shadow:rgba(0,0,0,.55)}
 html.light{
