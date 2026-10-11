@@ -85,7 +85,7 @@ install_pkg_if_missing python3 python3
 install_pkg_if_missing pip3 python3-pip
 
 # =============================================================================
-#  3.1 关键修复：确保 venv 和 ensurepip 可用（精简版）
+#  3.1 关键修复：确保 venv 可用（精简版，不装 python3-full）
 # =============================================================================
 if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || ! "$PYTHON_BIN" -m ensurepip --version >/dev/null 2>&1; then
     warn "检测到 python3-venv 或 ensurepip 缺失（Ubuntu/Debian 常见问题）。"
@@ -93,6 +93,7 @@ if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || ! "$PYTHON_BIN" -m ensurepi
     if [[ ! "${ans:-Y}" =~ ^[Nn]$ ]]; then
         apt-get update -qq
         PY_VER=$("$PYTHON_BIN" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')
+        # 优先安装精确匹配的 venv，失败则回退到通用包
         apt-get install -y "${PY_VER}-venv" || apt-get install -y python3-venv || true
         log "已尝试安装 python3-venv 相关包。"
     else
@@ -177,7 +178,7 @@ fi
 log "目录权限已收紧。"
 
 # =============================================================================
-#  8. 写入 systemd 服务
+#  8. 写入 systemd 服务（修复环境变量传参问题）
 # =============================================================================
 info "创建 systemd 服务：${SERVICE_FILE}"
 cat > "$SERVICE_FILE" <<EOF
@@ -190,9 +191,9 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=${INSTALL_DIR}
-Environment=PANEL_HOST=0.0.0.0
-Environment=PANEL_PORT=${PANEL_PORT}
-Environment=PANEL_FILE_ROOT=/
+Environment="PANEL_HOST=0.0.0.0"
+Environment="PANEL_PORT=${PANEL_PORT}"
+Environment="PANEL_FILE_ROOT=/"
 ExecStart=${VENV_PY} ${INSTALL_DIR}/app.py
 Restart=always
 RestartSec=3
@@ -238,10 +239,13 @@ case "${1:-}" in
         journalctl -u "$SERVICE" -f -n 100
         ;;
     enable)
-        systemctl enable --now "$SERVICE"
+        mkdir -p /etc/systemd/system/multi-user.target.wants
+        ln -sf /etc/systemd/system/${SERVICE}.service /etc/systemd/system/multi-user.target.wants/${SERVICE}.service
+        echo "已设置开机自启"
         ;;
     disable)
-        systemctl disable --now "$SERVICE"
+        rm -f /etc/systemd/system/multi-user.target.wants/${SERVICE}.service
+        echo "已取消开机自启"
         ;;
     uninstall)
         read -rp "确定要卸载 linux-panel 吗？[y/N] " ans
@@ -266,13 +270,17 @@ chmod 755 /usr/local/bin/linux-panel
 log "快捷管理命令已创建。"
 
 # =============================================================================
-#  10. 启动服务（强制报错不退出，保证有提示）
+#  10. 启动服务（使用手动软链接避免 systemd 报错）
 # =============================================================================
 info "重新加载 systemd 并启动服务..."
 systemctl daemon-reload || true
-# 先设置开机自启
-systemctl enable "$SERVICE" >/dev/null 2>&1 || warn "设置开机自启失败，请检查 systemd 状态。"
-# 再启动一次
+
+# 手动创建开机自启软链接（比 systemctl enable 兼容性更好）
+mkdir -p /etc/systemd/system/multi-user.target.wants
+ln -sf "$SERVICE_FILE" "/etc/systemd/system/multi-user.target.wants/${SERVICE_NAME}.service"
+log "已设置开机自启。"
+
+# 启动服务
 systemctl start "$SERVICE" || warn "服务启动失败，请使用 'sudo linux-panel logs' 查看日志排查。"
 
 # =============================================================================
