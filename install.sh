@@ -9,7 +9,7 @@
 
 # ----------------------------- 基本配置 -------------------------------------
 REPO_URL="https://github.com/hia1321/linux-panel.git"
-REPO_PATH="hia1321/linux-panel"          # 供 CDN 镜像使用
+REPO_PATH="hia1321/linux-panel"
 REPO_BRANCH="main"
 INSTALL_DIR="/opt/linux-panel"
 SERVICE_NAME="linux-panel"
@@ -31,7 +31,7 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[✗]${NC} $*" >&2; }
 
 # =============================================================================
-#  0. GitHub 镜像回退克隆（国内服务器必备）
+#  0. GitHub 镜像回退克隆
 # =============================================================================
 clone_repo() {
     local target="$1"
@@ -113,7 +113,7 @@ install_pkg_if_missing python3 python3
 install_pkg_if_missing pip3 python3-pip
 
 # =============================================================================
-#  3.1 确保 python3-venv 可用（精简安装，不装 python3-full）
+#  3.1 确保 python3-venv 可用
 # =============================================================================
 if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || ! "$PYTHON_BIN" -m ensurepip --version >/dev/null 2>&1; then
     warn "检测到 python3-venv 或 ensurepip 缺失（Ubuntu/Debian 常见问题）。"
@@ -129,13 +129,11 @@ if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || ! "$PYTHON_BIN" -m ensurepi
     fi
 fi
 
-# 二次确认 venv 是否真正可用
 if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
     err "python3-venv 仍不可用，请手动执行：sudo apt install python3-venv"
     exit 1
 fi
 
-# 检测可选命令（不阻塞安装）
 for opt in ssh-keygen ufw sshd; do
     if ! command -v "$opt" >/dev/null 2>&1; then
         warn "未检测到 ${opt}，面板对应功能可能不可用。"
@@ -143,7 +141,7 @@ for opt in ssh-keygen ufw sshd; do
 done
 
 # =============================================================================
-#  4. 克隆 / 更新仓库到 /opt/linux-panel
+#  4. 克隆 / 更新仓库
 # =============================================================================
 if [[ -d "$INSTALL_DIR" ]]; then
     if [[ -d "${INSTALL_DIR}/.git" ]]; then
@@ -219,6 +217,7 @@ log "目录权限已收紧。"
 
 # =============================================================================
 #  8. 写入 systemd 服务
+#  环境变量直接写进 ExecStart，避开 systemd 老版本 mangle 报错
 # =============================================================================
 info "创建 systemd 服务：${SERVICE_FILE}"
 cat > "$SERVICE_FILE" <<EOF
@@ -231,10 +230,7 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=${INSTALL_DIR}
-Environment="PANEL_HOST=0.0.0.0"
-Environment="PANEL_PORT=${PANEL_PORT}"
-Environment="PANEL_FILE_ROOT=/"
-ExecStart=${VENV_PY} ${INSTALL_DIR}/app.py
+ExecStart=/usr/bin/env PANEL_HOST=0.0.0.0 PANEL_PORT=${PANEL_PORT} PANEL_FILE_ROOT=/ ${VENV_PY} ${INSTALL_DIR}/app.py
 Restart=always
 RestartSec=3
 StandardOutput=journal
@@ -278,6 +274,9 @@ case "${1:-}" in
     logs)
         journalctl -u "$SERVICE" -f -n 100
         ;;
+    pass)
+        journalctl -u "$SERVICE" -n 200 --no-pager | grep -A 5 "面板已初始化"
+        ;;
     enable)
         mkdir -p /etc/systemd/system/multi-user.target.wants
         ln -sf /etc/systemd/system/${SERVICE}.service /etc/systemd/system/multi-user.target.wants/${SERVICE}.service
@@ -303,7 +302,7 @@ case "${1:-}" in
         echo "  sudo rm -rf /opt/linux-panel"
         ;;
     *)
-        echo "用法: sudo linux-panel {start|stop|restart|status|logs|enable|disable|uninstall}"
+        echo "用法: sudo linux-panel {start|stop|restart|status|logs|pass|enable|disable|uninstall}"
         ;;
 esac
 EOF
@@ -311,21 +310,22 @@ chmod 755 /usr/local/bin/linux-panel
 log "快捷管理命令已创建。"
 
 # =============================================================================
-#  10. 设置开机自启 + 启动服务（用软链接避开 systemd 老版本报错）
+#  10. 设置开机自启 + 启动服务
 # =============================================================================
 info "重新加载 systemd 并启动服务..."
 systemctl daemon-reload || true
 
-# 手动创建开机自启软链接（兼容性比 systemctl enable 更好）
 mkdir -p /etc/systemd/system/multi-user.target.wants
 ln -sf "$SERVICE_FILE" "/etc/systemd/system/multi-user.target.wants/${SERVICE_NAME}.service"
 log "已设置开机自启。"
 
-# 启动服务
-systemctl start "$SERVICE" || warn "服务启动失败，请使用 'sudo linux-panel logs' 查看日志排查。"
+systemctl start "$SERVICE" 2>&1 | grep -v "Failed to mangle name" | grep -v "Failed to expand names" || true
+
+# 等待服务初始化并打印初始信息
+sleep 3
 
 # =============================================================================
-#  11. 完成提示（一定会输出）
+#  11. 完成提示 + 自动抓取初始密码
 # =============================================================================
 echo
 echo -e "${GREEN}========================================${NC}"
@@ -334,10 +334,22 @@ echo -e "${GREEN}========================================${NC}"
 echo -e "  运行身份 : ${YELLOW}root${NC}（强制）"
 echo -e "  安装目录 : ${INSTALL_DIR}"
 echo -e "  访问地址 : ${GREEN}http://<服务器IP>:${PANEL_PORT}${NC}"
-echo -e "  管理命令 : ${YELLOW}sudo linux-panel {start|stop|restart|status|logs|uninstall}${NC}"
+echo -e "  管理命令 : ${YELLOW}sudo linux-panel {start|stop|restart|status|logs|pass|uninstall}${NC}"
 echo
-echo -e "  首次登录密码请查看日志："
-echo -e "  ${YELLOW}sudo journalctl -u linux-panel -n 50 --no-pager${NC}"
+
+# 抓取初始密码（只显示包含“面板已初始化”的部分）
+INIT_LOG=$(journalctl -u "$SERVICE_NAME" -n 200 --no-pager 2>/dev/null | grep -A 6 "面板已初始化" || true)
+if [[ -n "$INIT_LOG" ]]; then
+    echo -e "${YELLOW}  ─── 面板初始化信息 ───${NC}"
+    echo "$INIT_LOG" | sed 's/^.*python\[[0-9]*\]: //'
+    echo
+    echo -e "  ${YELLOW}请登录后立即修改密码！${NC}"
+else
+    warn "未在日志中找到“面板已初始化”信息。"
+    warn "可能数据库已存在（之前装过），请查看历史日志获取密码："
+    echo -e "    ${YELLOW}sudo linux-panel pass${NC}"
+fi
+
 echo
 echo -e "  如果启用了 UFW，请放行面板端口："
 echo -e "  ${YELLOW}sudo ufw allow ${PANEL_PORT}/tcp${NC}"
