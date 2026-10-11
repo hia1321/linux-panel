@@ -216,8 +216,19 @@ fi
 log "目录权限已收紧。"
 
 # =============================================================================
-#  8. 写入 systemd 服务
-#  环境变量直接写进 ExecStart，避开 systemd 老版本 mangle 报错
+#  8. 写入环境变量文件
+# =============================================================================
+info "创建环境变量文件：${INSTALL_DIR}/.env"
+cat > "${INSTALL_DIR}/.env" <<EOF
+PANEL_HOST=0.0.0.0
+PANEL_PORT=${PANEL_PORT}
+PANEL_FILE_ROOT=/
+EOF
+chmod 600 "${INSTALL_DIR}/.env"
+log "环境变量文件已创建。"
+
+# =============================================================================
+#  9. 写入 systemd 服务（使用 EnvironmentFile 标准方式）
 # =============================================================================
 info "创建 systemd 服务：${SERVICE_FILE}"
 cat > "$SERVICE_FILE" <<EOF
@@ -230,7 +241,8 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=/usr/bin/env PANEL_HOST=0.0.0.0 PANEL_PORT=${PANEL_PORT} PANEL_FILE_ROOT=/ ${VENV_PY} ${INSTALL_DIR}/app.py
+EnvironmentFile=${INSTALL_DIR}/.env
+ExecStart=${VENV_PY} ${INSTALL_DIR}/app.py
 Restart=always
 RestartSec=3
 StandardOutput=journal
@@ -242,7 +254,7 @@ EOF
 log "systemd 服务文件已创建。"
 
 # =============================================================================
-#  9. 写入快捷管理命令 linux-panel
+#  10. 写入快捷管理命令 linux-panel
 # =============================================================================
 info "创建快捷管理命令：/usr/local/bin/linux-panel"
 cat > /usr/local/bin/linux-panel <<'EOF'
@@ -275,7 +287,7 @@ case "${1:-}" in
         journalctl -u "$SERVICE" -f -n 100
         ;;
     pass)
-        journalctl -u "$SERVICE" -n 200 --no-pager | grep -A 5 "面板已初始化"
+        journalctl -u "$SERVICE" -n 200 --no-pager | grep -A 6 "面板已初始化"
         ;;
     enable)
         mkdir -p /etc/systemd/system/multi-user.target.wants
@@ -310,22 +322,34 @@ chmod 755 /usr/local/bin/linux-panel
 log "快捷管理命令已创建。"
 
 # =============================================================================
-#  10. 设置开机自启 + 启动服务
+#  11. 设置开机自启并启动服务
 # =============================================================================
 info "重新加载 systemd 并启动服务..."
 systemctl daemon-reload || true
 
+# 手动设置开机自启软链接（兼容性最好）
 mkdir -p /etc/systemd/system/multi-user.target.wants
 ln -sf "$SERVICE_FILE" "/etc/systemd/system/multi-user.target.wants/${SERVICE_NAME}.service"
 log "已设置开机自启。"
 
-systemctl start "$SERVICE" 2>&1 | grep -v "Failed to mangle name" | grep -v "Failed to expand names" || true
+# 记录启动时间，用于截取本次日志
+START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+
+# 启动服务（没有任何过滤，让 systemd 自己处理）
+systemctl start "$SERVICE" 2>&1 || warn "服务启动失败，请使用 'sudo linux-panel logs' 查看日志排查。"
 
 # 等待服务初始化并打印初始信息
 sleep 3
 
+# 检查服务是否真的在运行
+if systemctl is-active --quiet "$SERVICE"; then
+    log "服务已成功启动并运行中！"
+else
+    err "服务启动失败，请运行 'sudo linux-panel logs' 查看具体报错。"
+fi
+
 # =============================================================================
-#  11. 完成提示 + 自动抓取初始密码
+#  12. 完成提示 + 自动抓取本次启动的初始密码
 # =============================================================================
 echo
 echo -e "${GREEN}========================================${NC}"
@@ -337,17 +361,16 @@ echo -e "  访问地址 : ${GREEN}http://<服务器IP>:${PANEL_PORT}${NC}"
 echo -e "  管理命令 : ${YELLOW}sudo linux-panel {start|stop|restart|status|logs|pass|uninstall}${NC}"
 echo
 
-# 抓取初始密码（只显示包含“面板已初始化”的部分）
-INIT_LOG=$(journalctl -u "$SERVICE_NAME" -n 200 --no-pager 2>/dev/null | grep -A 6 "面板已初始化" || true)
+# 只抓取本次启动后的日志，彻底解决重复显示历史密码的问题
+INIT_LOG=$(journalctl -u "$SERVICE_NAME" --since "$START_TIME" --no-pager 2>/dev/null | grep -A 6 "面板已初始化" || true)
 if [[ -n "$INIT_LOG" ]]; then
     echo -e "${YELLOW}  ─── 面板初始化信息 ───${NC}"
     echo "$INIT_LOG" | sed 's/^.*python\[[0-9]*\]: //'
     echo
     echo -e "  ${YELLOW}请登录后立即修改密码！${NC}"
 else
-    warn "未在日志中找到“面板已初始化”信息。"
-    warn "可能数据库已存在（之前装过），请查看历史日志获取密码："
-    echo -e "    ${YELLOW}sudo linux-panel pass${NC}"
+    warn "未在本次启动日志中找到“面板已初始化”信息。"
+    warn "可能数据库已存在（之前装过），请尝试运行：sudo linux-panel pass"
 fi
 
 echo
