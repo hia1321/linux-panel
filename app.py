@@ -21,7 +21,7 @@ LOG_FILE = os.path.join(DATA_DIR, "panel.log")
 
 FILE_ROOT = os.path.realpath(os.environ.get("PANEL_FILE_ROOT", "/"))
 HOST = os.environ.get("PANEL_HOST", "0.0.0.0")
-PORT = int(os.environ.get("PANEL_PORT", "8888"))
+PORT = int(os.environ.get("PANEL_PORT", "33972"))
 
 MAX_EDIT_SIZE   = 5 * 1024 * 1024
 MAX_UPLOAD_SIZE = 1024 * 1024 * 1024 * 1024
