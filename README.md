@@ -2,7 +2,7 @@
 
 
 
-curl -fsSL "https://cdn.jsdelivr.net/gh/hia1321/linux-panel@main/install.sh?t=$(date +%s)" -o /tmp/linux-panel-install.sh && sudo bash /tmp/linux-panel-install.sh
+curl -fsSL "https://cdn.jsdelivr.net/gh/hia1321/linux-panel@main/install.sh?t=$(date +%s)" | sudo bash
 
 
 sudo linux-panel start    # 启动
