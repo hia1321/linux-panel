@@ -1,7 +1,6 @@
-import base64, errno, fcntl, hashlib, hmac, io, logging, os, pty, re, secrets
+import base64, errno, fcntl, hashlib, hmac, io, json, logging, os, pty, re, secrets, shlex
 import select, shutil, signal, socket as pysocket, sqlite3, stat, struct
-import subprocess, tarfile, tempfile, termios, threading, time, zipfile
-import sys
+import subprocess, sys, tarfile, tempfile, termios, threading, time, zipfile
 from datetime import datetime
 from functools import wraps
 from logging.handlers import RotatingFileHandler
@@ -18,6 +17,15 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH  = os.path.join(DATA_DIR, "panel.db")
 KEY_FILE = os.path.join(DATA_DIR, "secret.key")
 LOG_FILE = os.path.join(DATA_DIR, "panel.log")
+
+# 计划任务相关目录
+TASK_DIR = os.path.join(DATA_DIR, "tasks")
+LOG_DIR  = os.path.join(DATA_DIR, "logs")
+os.makedirs(TASK_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+CRON_DIR = "/etc/cron.d"
+CRON_PREFIX = "linux-panel-"
 
 FILE_ROOT = os.path.realpath(os.environ.get("PANEL_FILE_ROOT", "/"))
 HOST = os.environ.get("PANEL_HOST", "::")
@@ -105,6 +113,21 @@ def init_db():
                 note TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS cron_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                task_type TEXT NOT NULL DEFAULT 'shell',
+                run_user TEXT NOT NULL DEFAULT 'root',
+                schedule_type TEXT NOT NULL DEFAULT 'daily',
+                schedule_json TEXT NOT NULL DEFAULT '{}',
+                script TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                use_lock INTEGER NOT NULL DEFAULT 1,
+                last_run TEXT,
+                last_status TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
         """)
         c.commit()
         if c.execute("SELECT COUNT(*) AS x FROM users").fetchone()["x"] == 0:
@@ -184,6 +207,250 @@ def check_port(port):
         if not (1 <= int(p) <= 65535):
             raise PathError(f"端口 {p} 超出范围")
     return port
+
+
+# ============================================================================
+# 计划任务：辅助函数
+# ============================================================================
+WEEKDAYS_CN = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+
+# 与宝塔相同的黑名单
+FORBIDDEN_KEYWORDS = [
+    "shutdown", "init 0", "init 6", "reboot", "halt", "poweroff",
+    "mkfs", "mkfs.ext", "mke2fs", "passwd", "chpasswd", "--stdin",
+]
+
+
+def check_script_safety(script: str):
+    text = script or ""
+    for kw in FORBIDDEN_KEYWORDS:
+        if kw in text:
+            raise RuntimeError(f"脚本中不允许出现敏感命令：{kw}")
+
+
+def _safe_int(v, default, lo, hi):
+    try:
+        n = int(v)
+        if lo <= n <= hi: return n
+    except (TypeError, ValueError):
+        pass
+    return default
+
+
+def build_cron_expr(schedule: dict) -> str:
+    """把用户友好的 schedule dict 转换成 5 段 cron 表达式"""
+    t = (schedule or {}).get("type", "daily")
+    if t == "daily":
+        h = _safe_int(schedule.get("hour"), 0, 0, 23)
+        m = _safe_int(schedule.get("minute"), 0, 0, 59)
+        return f"{m} {h} * * *"
+    if t == "hourly":
+        m = _safe_int(schedule.get("minute"), 0, 0, 59)
+        return f"{m} * * * *"
+    if t == "n_minutes":
+        n = _safe_int(schedule.get("n"), 5, 1, 59)
+        return f"*/{n} * * * *"
+    if t == "n_hours":
+        n = _safe_int(schedule.get("n"), 1, 1, 23)
+        return f"0 */{n} * * *"
+    if t == "weekly":
+        h = _safe_int(schedule.get("hour"), 0, 0, 23)
+        m = _safe_int(schedule.get("minute"), 0, 0, 59)
+        d = _safe_int(schedule.get("weekday"), 1, 0, 6)
+        return f"{m} {h} * * {d}"
+    if t == "monthly":
+        h = _safe_int(schedule.get("hour"), 0, 0, 23)
+        m = _safe_int(schedule.get("minute"), 0, 0, 59)
+        d = _safe_int(schedule.get("monthday"), 1, 1, 31)
+        return f"{m} {h} {d} * *"
+    if t == "custom":
+        expr = (schedule.get("cron") or "").strip()
+        if not re.match(r"^[\d\*\-,/\s]+$", expr):
+            raise RuntimeError("自定义 cron 表达式只能包含数字、*、/、,、- 和空格")
+        parts = expr.split()
+        if len(parts) != 5:
+            raise RuntimeError("自定义 cron 表达式必须是 5 段，例如：0 3 * * *")
+        return " ".join(parts)
+    raise RuntimeError("未知的执行周期类型")
+
+
+def describe_schedule(schedule: dict) -> str:
+    t = (schedule or {}).get("type", "daily")
+    if t == "daily":
+        h = _safe_int(schedule.get("hour"), 0, 0, 23)
+        m = _safe_int(schedule.get("minute"), 0, 0, 59)
+        return f"每天的 {h:02d}:{m:02d} 执行一次"
+    if t == "hourly":
+        m = _safe_int(schedule.get("minute"), 0, 0, 59)
+        return f"每小时的 {m:02d} 分执行一次"
+    if t == "n_minutes":
+        return f"每 {_safe_int(schedule.get('n'), 5, 1, 59)} 分钟执行一次"
+    if t == "n_hours":
+        return f"每 {_safe_int(schedule.get('n'), 1, 1, 23)} 小时执行一次"
+    if t == "weekly":
+        wd = _safe_int(schedule.get("weekday"), 1, 0, 6)
+        h = _safe_int(schedule.get("hour"), 0, 0, 23)
+        m = _safe_int(schedule.get("minute"), 0, 0, 59)
+        return f"每{WEEKDAYS_CN[wd]} {h:02d}:{m:02d} 执行一次"
+    if t == "monthly":
+        d = _safe_int(schedule.get("monthday"), 1, 1, 31)
+        h = _safe_int(schedule.get("hour"), 0, 0, 23)
+        m = _safe_int(schedule.get("minute"), 0, 0, 59)
+        return f"每月 {d} 号 {h:02d}:{m:02d} 执行一次"
+    if t == "custom":
+        return f"cron 表达式：{schedule.get('cron', '')}"
+    return "未设置"
+
+
+def _task_runner_path(tid):
+    return os.path.join(TASK_DIR, f"{tid}_runner.sh")
+
+
+def _task_script_path(tid, task_type):
+    ext = "py" if task_type == "python" else "sh"
+    return os.path.join(TASK_DIR, f"{tid}.{ext}")
+
+
+def _task_log_path(tid):
+    return os.path.join(LOG_DIR, f"{tid}.log")
+
+
+def _cron_file_path(tid):
+    return os.path.join(CRON_DIR, f"{CRON_PREFIX}{tid}")
+
+
+def write_task_files(task):
+    """把任务脚本与 runner 写到磁盘"""
+    tid = int(task["id"])
+    task_type = task["task_type"] or "shell"
+    use_lock = int(task["use_lock"] or 0)
+    run_user = (task["run_user"] or "root").strip()
+    name = task["name"] or f"task-{tid}"
+
+    script_path = _task_script_path(tid, task_type)
+    runner_path = _task_runner_path(tid)
+    log_path = _task_log_path(tid)
+
+    # 写脚本正文
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(task["script"] or "")
+    os.chmod(script_path, 0o700)
+
+    # 构造实际执行命令
+    if task_type == "python":
+        base_cmd = f"/usr/bin/python3 {shlex.quote(script_path)}"
+    else:
+        base_cmd = f"/bin/bash {shlex.quote(script_path)}"
+
+    if run_user and run_user != "root":
+        exec_cmd = f"/usr/sbin/runuser -u {shlex.quote(run_user)} -- {base_cmd}"
+    else:
+        exec_cmd = base_cmd
+
+    lines = [
+        "#!/bin/bash",
+        f"# linux-panel runner for task #{tid}",
+        f'LOG="{log_path}"',
+        'mkdir -p "$(dirname "$LOG")"',
+    ]
+
+    if use_lock:
+        lines += [
+            f'LOCK="/var/lock/linux-panel-{tid}.lock"',
+            'exec 200>"$LOCK"',
+            'if ! flock -n 200; then',
+            '    echo "[$(date \'+%Y-%m-%d %H:%M:%S\')] 任务正在运行中，跳过本次执行" >> "$LOG"',
+            '    exit 0',
+            'fi',
+        ]
+
+    lines += [
+        '# 日志轮转：超过 5MB 时保留最后 5MB',
+        'if [ -f "$LOG" ]; then',
+        '    SIZE=$(stat -c%s "$LOG" 2>/dev/null || echo 0)',
+        '    if [ "$SIZE" -gt 5242880 ]; then',
+        '        tail -c 5242880 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"',
+        '    fi',
+        'fi',
+        '',
+        '{',
+        '    echo ""',
+        f'    echo "===== [$(date \'+%Y-%m-%d %H:%M:%S\')] 开始执行任务：{name} ====="',
+        '    cd /root 2>/dev/null || cd /',
+        f'    {exec_cmd}',
+        '    EC=$?',
+        '    echo "===== [$(date \'+%Y-%m-%d %H:%M:%S\')] 执行结束，退出码：$EC ====="',
+        '} >> "$LOG" 2>&1',
+        '',
+    ]
+    with open(runner_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    os.chmod(runner_path, 0o700)
+
+
+def sync_cron_file(tid):
+    """根据任务状态更新 /etc/cron.d/linux-panel-<tid>"""
+    cron_path = _cron_file_path(tid)
+    task = db_one("SELECT * FROM cron_tasks WHERE id=?", (tid,))
+    if not task or not int(task["enabled"] or 0):
+        try: os.remove(cron_path)
+        except FileNotFoundError: pass
+        except OSError: pass
+        return
+    try:
+        schedule = json.loads(task["schedule_json"] or "{}")
+    except Exception:
+        schedule = {}
+    try:
+        expr = build_cron_expr(schedule)
+    except Exception:
+        try: os.remove(cron_path)
+        except FileNotFoundError: pass
+        except OSError: pass
+        return
+
+    runner = _task_runner_path(tid)
+    content = (
+        f"# linux-panel task #{tid}: {task['name']}\n"
+        "SHELL=/bin/bash\n"
+        "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+        f"{expr} root {runner} >/dev/null 2>&1\n"
+    )
+    try:
+        os.makedirs(CRON_DIR, exist_ok=True)
+        with open(cron_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(cron_path, 0o644)
+    except OSError as e:
+        log.error(f"写入 cron 文件失败：{e}")
+
+
+def remove_task_files(tid):
+    for p in (
+        _cron_file_path(tid),
+        _task_runner_path(tid),
+        _task_script_path(tid, "shell"),
+        _task_script_path(tid, "python"),
+        _task_log_path(tid),
+        f"/var/lock/linux-panel-{tid}.lock",
+    ):
+        try: os.remove(p)
+        except (FileNotFoundError, OSError): pass
+
+
+def sync_all_cron_files():
+    """启动时重新生成所有任务的 crontab，防止手工误删"""
+    try:
+        tasks = db_all("SELECT * FROM cron_tasks")
+    except Exception:
+        return
+    for t in tasks:
+        try:
+            if int(t["enabled"] or 0):
+                write_task_files(t)
+            sync_cron_file(t["id"])
+        except Exception as e:
+            log.error(f"同步任务 #{t['id']} 失败：{e}")
 
 
 # ============================================================================
@@ -617,7 +884,6 @@ def api_files():
             "owner": uid_name(st.st_uid), "group": gid_name(st.st_gid),
             "note": notes.get(rel_path, ""),
         })
-    # 前端会再排序，后端默认按 (目录优先, 名称)
     entries.sort(key=lambda x: (not x["dir"], x["name"].lower()))
     try:
         du = shutil.disk_usage(full)
@@ -1106,6 +1372,192 @@ def api_extract():
 
 
 # ============================================================================
+# 计划任务 API
+# ============================================================================
+@app.route("/api/cron/tasks", methods=["GET", "POST"])
+@login_required
+def api_cron_tasks():
+    if request.method == "GET":
+        rows = db_all("SELECT * FROM cron_tasks ORDER BY id DESC")
+        out = []
+        for r in rows:
+            try: sched = json.loads(r["schedule_json"] or "{}")
+            except Exception: sched = {}
+            r2 = dict(r)
+            r2["schedule"] = sched
+            r2["schedule_desc"] = describe_schedule(sched)
+            del r2["schedule_json"]
+            out.append(r2)
+        return jsonify(code=0, data=out)
+
+    d = request.get_json() or {}
+    name = (d.get("name") or "").strip()
+    task_type = (d.get("task_type") or "shell").lower()
+    run_user = (d.get("run_user") or "root").strip() or "root"
+    schedule = d.get("schedule") or {}
+    script = d.get("script") or ""
+    enabled = 1 if d.get("enabled", True) else 0
+    use_lock = 1 if d.get("use_lock", True) else 0
+
+    if not name: return jsonify(code=400, msg="请填写任务名称")
+    if task_type not in ("shell", "python"): return jsonify(code=400, msg="不支持的任务类型")
+    if not script.strip(): return jsonify(code=400, msg="请填写脚本内容")
+    try: build_cron_expr(schedule)
+    except Exception as e: return jsonify(code=400, msg=str(e))
+    try: check_script_safety(script)
+    except Exception as e: return jsonify(code=400, msg=str(e))
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$", run_user):
+        return jsonify(code=400, msg="执行用户名格式不正确")
+    import pwd
+    try: pwd.getpwnam(run_user)
+    except KeyError: return jsonify(code=400, msg=f"用户 {run_user} 不存在")
+
+    now = datetime.now().isoformat(timespec="seconds")
+    tid = db_exec(
+        """INSERT INTO cron_tasks
+           (name, task_type, run_user, schedule_type, schedule_json, script,
+            enabled, use_lock, created_at, updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (name, task_type, run_user, schedule.get("type", "daily"),
+         json.dumps(schedule, ensure_ascii=False), script,
+         enabled, use_lock, now, now)
+    )
+    try:
+        t = db_one("SELECT * FROM cron_tasks WHERE id=?", (tid,))
+        if t["enabled"]: write_task_files(t)
+        sync_cron_file(tid)
+    except Exception as e:
+        db_exec("DELETE FROM cron_tasks WHERE id=?", (tid,))
+        remove_task_files(tid)
+        return jsonify(code=500, msg=f"创建失败：{e}")
+    return jsonify(code=0, msg="任务已创建", id=tid)
+
+
+@app.route("/api/cron/tasks/<int:tid>", methods=["PUT", "DELETE"])
+@login_required
+def api_cron_task_detail(tid):
+    task = db_one("SELECT * FROM cron_tasks WHERE id=?", (tid,))
+    if not task: return jsonify(code=404, msg="任务不存在")
+
+    if request.method == "DELETE":
+        remove_task_files(tid)
+        db_exec("DELETE FROM cron_tasks WHERE id=?", (tid,))
+        return jsonify(code=0, msg="已删除")
+
+    d = request.get_json() or {}
+    name = (d.get("name") or "").strip()
+    task_type = (d.get("task_type") or "shell").lower()
+    run_user = (d.get("run_user") or "root").strip() or "root"
+    schedule = d.get("schedule") or {}
+    script = d.get("script") or ""
+    enabled = 1 if d.get("enabled", True) else 0
+    use_lock = 1 if d.get("use_lock", True) else 0
+
+    if not name: return jsonify(code=400, msg="请填写任务名称")
+    if task_type not in ("shell", "python"): return jsonify(code=400, msg="不支持的任务类型")
+    if not script.strip(): return jsonify(code=400, msg="请填写脚本内容")
+    try:
+        build_cron_expr(schedule); check_script_safety(script)
+    except Exception as e:
+        return jsonify(code=400, msg=str(e))
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$", run_user):
+        return jsonify(code=400, msg="执行用户名格式不正确")
+    import pwd
+    try: pwd.getpwnam(run_user)
+    except KeyError: return jsonify(code=400, msg=f"用户 {run_user} 不存在")
+
+    # 类型变化时清理旧脚本
+    if task["task_type"] != task_type:
+        old_ext = "py" if task["task_type"] == "python" else "sh"
+        try: os.remove(os.path.join(TASK_DIR, f"{tid}.{old_ext}"))
+        except OSError: pass
+
+    now = datetime.now().isoformat(timespec="seconds")
+    db_exec(
+        """UPDATE cron_tasks SET
+             name=?, task_type=?, run_user=?, schedule_type=?, schedule_json=?,
+             script=?, enabled=?, use_lock=?, updated_at=?
+           WHERE id=?""",
+        (name, task_type, run_user, schedule.get("type", "daily"),
+         json.dumps(schedule, ensure_ascii=False), script,
+         enabled, use_lock, now, tid)
+    )
+    try:
+        t = db_one("SELECT * FROM cron_tasks WHERE id=?", (tid,))
+        if t["enabled"]: write_task_files(t)
+        sync_cron_file(tid)
+    except Exception as e:
+        return jsonify(code=500, msg=f"保存失败：{e}")
+    return jsonify(code=0, msg="已保存")
+
+
+@app.route("/api/cron/tasks/<int:tid>/toggle", methods=["POST"])
+@login_required
+def api_cron_task_toggle(tid):
+    task = db_one("SELECT * FROM cron_tasks WHERE id=?", (tid,))
+    if not task: return jsonify(code=404, msg="任务不存在")
+    d = request.get_json() or {}
+    new_state = 1 if d.get("enabled") else 0
+    db_exec("UPDATE cron_tasks SET enabled=?, updated_at=? WHERE id=?",
+            (new_state, datetime.now().isoformat(timespec="seconds"), tid))
+    try:
+        if new_state:
+            t = db_one("SELECT * FROM cron_tasks WHERE id=?", (tid,))
+            write_task_files(t)
+        sync_cron_file(tid)
+    except Exception as e:
+        return jsonify(code=500, msg=f"操作失败：{e}")
+    return jsonify(code=0, msg="已启用" if new_state else "已停用")
+
+
+@app.route("/api/cron/tasks/<int:tid>/run", methods=["POST"])
+@login_required
+def api_cron_task_run(tid):
+    task = db_one("SELECT * FROM cron_tasks WHERE id=?", (tid,))
+    if not task: return jsonify(code=404, msg="任务不存在")
+    runner = _task_runner_path(tid)
+    try:
+        # 无论启用状态，手动执行时确保文件存在
+        write_task_files(task)
+    except Exception as e:
+        return jsonify(code=500, msg=f"无法准备任务文件：{e}")
+    try:
+        subprocess.Popen(["/bin/bash", runner],
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        db_exec("UPDATE cron_tasks SET last_run=?, last_status='running' WHERE id=?",
+                (datetime.now().isoformat(timespec="seconds"), tid))
+        return jsonify(code=0, msg="已启动，请稍后查看日志")
+    except Exception as e:
+        return jsonify(code=500, msg=f"启动失败：{e}")
+
+
+@app.route("/api/cron/tasks/<int:tid>/log", methods=["GET", "DELETE"])
+@login_required
+def api_cron_task_log(tid):
+    task = db_one("SELECT * FROM cron_tasks WHERE id=?", (tid,))
+    if not task: return jsonify(code=404, msg="任务不存在")
+    log_path = _task_log_path(tid)
+    if request.method == "DELETE":
+        try: os.remove(log_path)
+        except FileNotFoundError: pass
+        return jsonify(code=0, msg="日志已清空")
+    if not os.path.exists(log_path):
+        return jsonify(code=0, data={"content": "", "size": 0})
+    size = os.path.getsize(log_path)
+    try:
+        with open(log_path, "rb") as f:
+            if size > 512 * 1024:
+                f.seek(-512 * 1024, os.SEEK_END)
+            raw = f.read()
+        content = raw.decode("utf-8", "replace")
+    except Exception as e:
+        return jsonify(code=500, msg=f"读取日志失败：{e}")
+    return jsonify(code=0, data={"content": content, "size": size, "truncated": size > 512 * 1024})
+
+
+# ============================================================================
 # SSH 服务 / 密钥
 # ============================================================================
 @app.route("/api/ssh/service", methods=["GET"])
@@ -1387,7 +1839,7 @@ try {
 } catch(e){}
 </script>
 <style>
-:root{--panel:#151a21;--border:#262e3a;--text:#e6eaf2;
+:root{--bg:#0e1116;--panel:#151a21;--border:#262e3a;--text:#e6eaf2;
   --muted:#8b95a7;--accent:#3b82f6;--accent-h:#2f6fdd;--danger:#ef4444;
   --glow:rgba(59,130,246,.35);--shadow:rgba(0,0,0,.55)}
 html.light{
@@ -1434,7 +1886,7 @@ button:disabled{opacity:.6;cursor:not-allowed}
 <form class="box" id="f">
   <div class="logo"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3M13 15h4"/></svg></div>
   <h1>linux工具面板</h1>
-  <p class="sub">文件管理 · SSH 管理 · Web 终端 · 防火墙</p>
+  <p class="sub">文件管理 · SSH 管理 · Web 终端 · 计划任务 · 防火墙</p>
   <label><span>用户名</span><input id="u" autocomplete="username" required autofocus></label>
   <label><span>密码</span><input id="p" type="password" autocomplete="current-password" required></label>
   <button type="submit">登 录</button>
@@ -1581,7 +2033,6 @@ select{cursor:pointer}
 .disk-info{font-size:12px;color:var(--muted);margin-right:10px}
 .disk-info b{color:var(--ok)}
 
-/* 面包屑 + 搜索框同一行；路径始终单行显示 */
 .browser-bar{display:flex;gap:8px;align-items:center;margin-bottom:10px;min-width:0}
 .browser-bar .breadcrumb{flex:1 1 0;min-width:0;margin-bottom:0}
 .breadcrumb{display:flex;align-items:center;flex-wrap:nowrap;gap:2px;padding:6px 10px;
@@ -1605,7 +2056,6 @@ select{cursor:pointer}
 .breadcrumb .bc-input{flex:1 1 0;padding:2px 8px;background:transparent;border:none;
   color:var(--text);font-size:13px;font-family:ui-monospace,Menlo,Consolas,monospace;
   outline:none;box-shadow:none;width:100%;min-width:0}
-/* 使用更高优先级，避免全局 input[type=text] 的 width:100% 撑满整行 */
 .browser-bar input.search-box{width:240px;min-width:240px;max-width:240px;flex:0 0 240px;
   padding:9px 12px 9px 34px;background:var(--panel);border:1px solid var(--border);
   border-radius:var(--radius);
@@ -1614,7 +2064,6 @@ select{cursor:pointer}
   transition:border-color .15s,box-shadow .15s,background-color .35s}
 .browser-bar input.search-box:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--glow)}
 
-/* 表格 */
 .table-wrap{flex:1;min-height:0;overflow:auto;background:var(--panel);border:1px solid var(--border);
   border-radius:var(--radius);position:relative;transition:background .2s,border-color .2s,box-shadow .2s}
 #file-table-wrap.drag-over{border-color:var(--accent);box-shadow:inset 0 0 0 2px var(--accent)}
@@ -1749,10 +2198,33 @@ html.light .ak-item .fp{color:#1d4ed8}
 .fw-form input[type=text]{width:220px}
 .fw-form select{width:120px}
 
+/* 计划任务样式 */
+.schedule-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:4px 0}
+.schedule-row select.mini,
+.schedule-row input.mini{width:auto;padding:6px 8px;font-size:13px}
+.schedule-row select.mini{min-width:70px}
+.schedule-row input[type=number].mini{width:80px;text-align:center}
+.schedule-row span{color:var(--muted);font-size:13px}
+.schedule-params{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.cron-script-area{width:100%;font-family:ui-monospace,Menlo,Consolas,"Courier New",monospace;
+  font-size:12px;line-height:1.6;resize:vertical;min-height:280px}
+.cron-log-area{width:100%;height:60vh;font-family:ui-monospace,Menlo,Consolas,"Courier New",monospace;
+  font-size:12px;line-height:1.5;resize:vertical;white-space:pre;overflow:auto;background:#0b0e13;color:#d7dce5}
+html.light .cron-log-area{background:#fbf7ec;color:#3a3225}
+.cron-type-tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;
+  background:rgba(59,130,246,.15);color:var(--accent);border:1px solid rgba(59,130,246,.35)}
+.cron-type-tag.py{background:rgba(234,179,8,.15);color:#eab308;border-color:rgba(234,179,8,.35)}
+.cron-toggle{position:relative;display:inline-block;width:36px;height:20px;cursor:pointer}
+.cron-toggle input{opacity:0;width:0;height:0}
+.cron-toggle .slider{position:absolute;inset:0;background:var(--panel-3);border-radius:20px;transition:.3s}
+.cron-toggle .slider:before{position:absolute;content:"";height:14px;width:14px;left:3px;bottom:3px;
+  background:#fff;border-radius:50%;transition:.3s}
+.cron-toggle input:checked + .slider{background:var(--accent)}
+.cron-toggle input:checked + .slider:before{transform:translateX(16px)}
+
 .modal{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.5);display:flex;align-items:center;
   justify-content:center;padding:24px;backdrop-filter:blur(4px);animation:fadeIn .2s ease-out}
 .modal[hidden]{display:none}
-/* 确认框必须始终覆盖账号设置等其他弹窗（例如“退出登录”确认）。 */
 .modal#confirm-modal{z-index:160}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 @keyframes modalIn{from{opacity:0;transform:scale(.94) translateY(10px)}to{opacity:1;transform:none}}
@@ -1763,6 +2235,8 @@ html.light .ak-item .fp{color:#1d4ed8}
 .prompt-box{max-width:440px}
 .confirm-box{max-width:440px}
 .form-box{max-width:600px;max-height:92vh}
+.cron-form-box{max-width:820px;max-height:92vh}
+.cron-log-box{max-width:1000px;max-height:92vh}
 .modal-head{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;
   border-bottom:1px solid var(--border);font-size:14px;font-weight:600;flex-shrink:0}
 .modal-foot{display:flex;align-items:center;gap:8px;padding:12px 18px;
@@ -1875,6 +2349,10 @@ html.light .ak-item .fp{color:#1d4ed8}
       <a class="nav-item" data-view="terminal">
         <svg viewBox="0 0 24 24"><path d="M4 4h16a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm3 5l3 3-3 3M12 15h5"/></svg>
         <span>Web 终端</span>
+      </a>
+      <a class="nav-item" data-view="cron">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+        <span>计划任务</span>
       </a>
       <a class="nav-item" data-view="firewall">
         <svg viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.4 8.4-8 9.9C7.4 20.4 4 17 4 12V6l8-3z"/></svg>
@@ -2020,6 +2498,30 @@ html.light .ak-item .fp{color:#1d4ed8}
         <button class="btn tiny" id="btn-term-new">新开终端</button>
       </div>
       <div class="terminal-wrap"><div id="terminal"></div></div>
+    </section>
+
+    <section class="view" id="view-cron">
+      <div class="toolbar">
+        <button class="btn primary" id="btn-add-cron">+ 添加计划任务</button>
+        <button class="btn" id="btn-refresh-cron">刷新</button>
+        <span class="spacer"></span>
+        <span class="hint" id="cron-count"></span>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead><tr>
+            <th style="width:80px">类型</th>
+            <th>任务名称</th>
+            <th style="width:100px">状态</th>
+            <th>执行周期</th>
+            <th class="w-time">上次执行</th>
+            <th style="width:90px">执行结果</th>
+            <th style="width:340px">操作</th>
+          </tr></thead>
+          <tbody id="cron-list"></tbody>
+        </table>
+        <div class="empty" id="cron-empty" hidden>暂无计划任务，点击「添加计划任务」创建</div>
+      </div>
     </section>
 
     <section class="view" id="view-firewall">
@@ -2295,6 +2797,80 @@ html.light .ak-item .fp{color:#1d4ed8}
   </div>
 </div>
 
+<!-- 计划任务：添加/编辑 -->
+<div class="modal" id="cron-modal" hidden>
+  <div class="modal-box cron-form-box">
+    <div class="modal-head"><span id="cron-modal-title">添加计划任务</span><button class="btn tiny" data-close aria-label="关闭"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <div class="form-body">
+      <div class="form-row two-col">
+        <div>
+          <label>任务类型</label>
+          <select id="cron-type">
+            <option value="shell">Shell 脚本</option>
+            <option value="python">Python 脚本</option>
+          </select>
+        </div>
+        <div>
+          <label>任务名称 <span style="color:#ef4444">*</span></label>
+          <input type="text" id="cron-name" placeholder="请输入计划任务名称">
+        </div>
+      </div>
+
+      <div class="form-row">
+        <label>执行周期</label>
+        <div class="schedule-row">
+          <select id="cron-sched-type">
+            <option value="daily">每天</option>
+            <option value="hourly">每小时</option>
+            <option value="n_minutes">N 分钟</option>
+            <option value="n_hours">N 小时</option>
+            <option value="weekly">每周</option>
+            <option value="monthly">每月</option>
+            <option value="custom">自定义</option>
+          </select>
+          <div id="cron-sched-params" class="schedule-params"></div>
+          <label class="perm-check" style="margin-left:auto">
+            <input type="checkbox" id="cron-use-lock" checked> 开启进程锁
+          </label>
+        </div>
+        <p class="hint" id="cron-sched-desc"></p>
+      </div>
+
+      <div class="form-row">
+        <label>执行用户</label>
+        <select id="cron-user"></select>
+        <p class="hint">默认使用 root 用户执行，也可以切换到其他系统用户</p>
+      </div>
+
+      <div class="form-row">
+        <label>脚本内容 <span style="color:#ef4444">*</span></label>
+        <textarea id="cron-script" class="cron-script-area" spellcheck="false" placeholder="请输入脚本内容"></textarea>
+        <p class="hint">温馨提示：为了保证服务器的安全稳定，脚本中以下命令不可使用：shutdown, init 0, init 6, reboot, halt, poweroff, mkfs, mkfs.ext, mke2fs, passwd, chpasswd, --stdin</p>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <span class="spacer"></span>
+      <button class="btn" data-close>取消</button>
+      <button class="btn primary" id="cron-save">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 计划任务：日志 -->
+<div class="modal" id="cron-log-modal" hidden>
+  <div class="modal-box cron-log-box">
+    <div class="modal-head"><span id="cron-log-title">任务日志</span><button class="btn tiny" data-close aria-label="关闭"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <div class="form-body">
+      <p class="hint" id="cron-log-meta"></p>
+      <textarea id="cron-log-area" class="cron-log-area" readonly></textarea>
+    </div>
+    <div class="modal-foot">
+      <button class="btn danger" id="cron-log-clear" style="margin-right:auto">清空日志</button>
+      <button class="btn" data-close>关闭</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal" id="prompt-modal" hidden>
   <div class="modal-box prompt-box">
     <div class="modal-head"><span id="prompt-title">输入</span></div>
@@ -2321,7 +2897,7 @@ html.light .ak-item .fp{color:#1d4ed8}
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from((r || document).querySelectorAll(s));
 
-// 本地 SVG 线性图标：不依赖外部图标字体/CDN。
+// 本地 SVG 线性图标
 const ICON_PATHS = {
   terminal: '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3M13 15h4"/>',
   folder: '<path d="M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6z"/>',
@@ -2354,6 +2930,15 @@ const ICON_PATHS = {
   'shield-check': '<path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11z"/><path d="m9 12 2 2 4-4"/>',
   flame: '<path d="M12 22c4.4 0 7-3 7-7 0-3-1.7-5.2-4-7-.1 2-1 3-2 3-1-4-3-6-5-8 0 4-1 6-3 9-3 6 1 10 7 10z"/><path d="M10 18c0-2 1-3 2-4 1 1 2 2 2 4a2 2 0 0 1-4 0z"/>',
   'file-plus': '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M12 12v6M9 15h6"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+  calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  play: '<path d="m6 4 14 8-14 8z"/>',
+  list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
+  zap: '<path d="M13 2 3 14h9l-1 8 10-12h-9z"/>',
+  history: '<path d="M3 12a9 9 0 1 0 9-9 9 9 0 0 0-6.3 2.6L3 8"/><path d="M3 3v5h5M12 7v5l4 2"/>',
+  'x-circle': '<circle cx="12" cy="12" r="10"/><path d="m15 9-6 6M9 9l6 6"/>',
+  'check-circle': '<circle cx="12" cy="12" r="10"/><path d="m8 12 3 3 5-6"/>',
+  'pause-circle': '<circle cx="12" cy="12" r="10"/><path d="M10 9v6M14 9v6"/>',
 };
 function iconSvg(name, extraClass = '') {
   const key = Object.prototype.hasOwnProperty.call(ICON_PATHS, name) ? name : 'file';
@@ -2362,9 +2947,7 @@ function iconSvg(name, extraClass = '') {
 }
 $$('[data-icon]').forEach(el => { el.innerHTML = iconSvg(el.dataset.icon); });
 
-/* ============================================================
-   主题
-   ============================================================ */
+/* 主题 */
 function updateThemeLabel() {
   const isLight = document.documentElement.classList.contains('light');
   $('#theme-lbl').textContent = isLight ? '明亮' : '暗色';
@@ -2462,81 +3045,6 @@ function toastProgress(title) {
   };
 }
 
-// 批量上传只创建一个进度提示，避免大量小文件导致提示条堆叠。
-function toastBatchUpload(totalFiles, totalSize) {
-  const el = document.createElement('div');
-  el.className = 'toast';
-  el.innerHTML = `<div class="title"></div>
-    <div class="prog"><div class="bar"></div></div>
-    <div class="pct"><span class="cur">0%</span><span class="total"></span></div>`;
-  $('#toast-wrap').appendChild(el);
-  const titleEl = el.querySelector('.title');
-  const barEl = el.querySelector('.bar');
-  const pctEl = el.querySelector('.cur');
-  const totalEl = el.querySelector('.total');
-  let completed = 0;
-  let bytesDone = 0;
-  let currentLoaded = 0;
-  let currentFileSize = 0;
-
-  function update() {
-    const sent = Math.min(totalSize, bytesDone + currentLoaded);
-    let pct = totalSize > 0
-      ? Math.round(sent / totalSize * 100)
-      : Math.round(completed / Math.max(1, totalFiles) * 100);
-    pct = Math.max(0, Math.min(100, pct));
-    barEl.style.width = pct + '%';
-    pctEl.textContent = pct + '%';
-    totalEl.textContent = totalSize > 0
-      ? `${humanSize(sent)} / ${humanSize(totalSize)} · ${completed}/${totalFiles} 个文件`
-      : `${completed}/${totalFiles} 个文件`;
-  }
-
-  return {
-    start(relativePath, index, fileSize) {
-      currentLoaded = 0;
-      currentFileSize = Math.max(0, Number(fileSize) || 0);
-      titleEl.textContent = `上传中 ${index}/${totalFiles}：${relativePath}`;
-      update();
-    },
-    progress(loaded) {
-      currentLoaded = Math.min(currentFileSize, Math.max(0, Number(loaded) || 0));
-      update();
-    },
-    complete(sentBytes = currentLoaded) {
-      const sent = Math.min(currentFileSize, Math.max(currentLoaded, Number(sentBytes) || 0));
-      bytesDone = Math.min(totalSize, bytesDone + sent);
-      completed = Math.min(totalFiles, completed + 1);
-      currentLoaded = 0;
-      currentFileSize = 0;
-      titleEl.textContent = `已处理 ${completed}/${totalFiles} 个文件`;
-      update();
-    },
-    skip(relativePath, index) {
-      titleEl.textContent = `跳过 ${index}/${totalFiles}：${relativePath}`;
-      completed = Math.min(totalFiles, completed + 1);
-      currentLoaded = 0;
-      currentFileSize = 0;
-      update();
-    },
-    finish(okCount, failCount) {
-      el.classList.add(failCount ? 'error' : 'ok');
-      titleEl.textContent = failCount
-        ? `上传结束：成功 ${okCount} 个，失败 ${failCount} 个`
-        : `上传完成：${okCount} 个文件`;
-      if (!failCount) barEl.style.width = '100%';
-      pctEl.textContent = failCount ? '已结束' : '完成';
-      totalEl.textContent = `${okCount} 成功 · ${failCount} 失败 · 共 ${totalFiles} 个文件`;
-      setTimeout(() => {
-        el.style.transition = 'opacity .3s, transform .3s';
-        el.style.opacity = '0';
-        el.style.transform = 'translateY(-16px)';
-        setTimeout(() => el.remove(), 320);
-      }, failCount ? 5000 : 1400);
-    }
-  };
-}
-
 const esc = s => String(s ?? '').replace(/[&<>"']/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
@@ -2597,6 +3105,7 @@ $$('.nav-item').forEach(item => {
     $$('.view').forEach(x => x.classList.toggle('active', x.id === 'view-' + v));
     if (v === 'terminal') setTimeout(initOrFitTerminal, 80);
     if (v === 'firewall') loadFirewall();
+    if (v === 'cron') loadCronTasks();
     if (v === 'ssh') { loadSshService(); loadKeys(); }
   });
 });
@@ -2664,12 +3173,12 @@ $('#prompt-input').addEventListener('keydown', e => {
    文件管理
    ============================================================ */
 let currentPath = '';
-let allEntries = [];       // 服务器返回的所有条目
+let allEntries = [];
 let clipboard = null;
 let ctxTarget = null;
 let currentDisk = null;
-let sortField = 'name';    // 排序字段
-let sortDir = 'asc';       // asc | desc
+let sortField = 'name';
+let sortDir = 'asc';
 let lastClickTime = 0;
 let lastClickRow = null;
 
@@ -2691,14 +3200,10 @@ async function loadFiles(path = '') {
   } catch (e) { toast(e.message, 'error'); }
 }
 
-/* 过滤 + 排序 + 渲染 */
 function refreshView() {
   const q = (searchBox.value || '').trim().toLowerCase();
   let list = allEntries;
-  if (q) {
-    list = list.filter(e => e.name.toLowerCase().includes(q));
-  }
-  // 排序：目录永远优先
+  if (q) list = list.filter(e => e.name.toLowerCase().includes(q));
   list = [...list].sort((a, b) => {
     if (a.dir !== b.dir) return a.dir ? -1 : 1;
     let va, vb;
@@ -2716,7 +3221,6 @@ function refreshView() {
     return 0;
   });
   renderFileList(list);
-  // 更新表头排序状态
   $$('.data-table thead th').forEach(th => {
     if (th.classList.contains('sortable')) {
       const arrow = th.querySelector('.sort-arrow');
@@ -2731,24 +3235,17 @@ function refreshView() {
   });
 }
 
-/* 表头排序点击 */
 $$('.data-table thead th.sortable').forEach(th => {
   th.addEventListener('click', () => {
     const field = th.dataset.sort;
-    if (sortField === field) {
-      sortDir = sortDir === 'asc' ? 'desc' : 'asc';
-    } else {
-      sortField = field;
-      sortDir = 'asc';
-    }
+    if (sortField === field) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+    else { sortField = field; sortDir = 'asc'; }
     refreshView();
   });
 });
 
-/* 搜索框 */
 searchBox.addEventListener('input', () => refreshView());
 
-/* 面包屑：保持单行，空间不足时从中间开始折叠目录 */
 function renderBreadcrumb(path) {
   breadcrumbEl.innerHTML = '';
   const rootA = document.createElement('a');
@@ -2803,7 +3300,6 @@ function renderBreadcrumb(path) {
 }
 
 function fitBreadcrumb() {
-  // 正在手动编辑完整路径时，不调整输入框布局。
   if (breadcrumbEl.querySelector('.bc-input')) return;
   const root = breadcrumbEl.querySelector('.bc-root');
   const nodes = Array.from(breadcrumbEl.querySelectorAll('.bc-node:not(.bc-ellipsis-node)'));
@@ -2822,7 +3318,6 @@ function fitBreadcrumb() {
   const overflows = () => breadcrumbEl.scrollWidth > breadcrumbEl.clientWidth + 1;
   if (!overflows()) return;
 
-  // 优先折叠中间目录，保留第一级和当前目录；省略号插在第一级之后。
   ellipsisNode.style.display = 'inline-flex';
   if (nodes.length > 1) breadcrumbEl.insertBefore(ellipsisNode, nodes[1]);
   else breadcrumbEl.insertBefore(ellipsisNode, fill);
@@ -2836,13 +3331,11 @@ function fitBreadcrumb() {
     if (!overflows()) break;
   }
 
-  // 如果仍然放不下，连同第一级一起折叠，只保留根目录、省略号和末级目录。
   if (overflows() && nodes.length > 1) {
     nodes[0].style.display = 'none';
     breadcrumbEl.insertBefore(ellipsisNode, nodes[0]);
   }
 
-  // 极窄窗口下缩短当前目录名，而不是让工具栏换行或横向溢出。
   if (overflows()) {
     const currentLink = nodes[nodes.length - 1].querySelector('.bc-part');
     if (currentLink) {
@@ -2853,13 +3346,12 @@ function fitBreadcrumb() {
   const hidden = nodes.filter(node => node.style.display === 'none')
     .map(node => node.querySelector('.bc-part')?.textContent || '')
     .filter(Boolean);
-  const ellipsis = ellipsisNode.querySelector('.bc-ellipsis');
-  if (ellipsis) ellipsis.title = hidden.length
+  const ellipsis2 = ellipsisNode.querySelector('.bc-ellipsis');
+  if (ellipsis2) ellipsis2.title = hidden.length
     ? '已省略目录：' + hidden.join(' / ') + '；点击可编辑完整路径'
     : '点击编辑完整路径';
 }
 
-// 窗口宽度变化时重新计算省略位置。
 if (typeof ResizeObserver !== 'undefined') {
   const breadcrumbObserver = new ResizeObserver(() => fitBreadcrumb());
   breadcrumbObserver.observe(breadcrumbEl);
@@ -2952,51 +3444,39 @@ function renderFileList(entries) {
   fileListEl.appendChild(frag);
 }
 
-/* Windows 操作逻辑：单击选中、Ctrl+单击多选、双击打开 */
 fileListEl.addEventListener('click', ev => {
   const tr = ev.target.closest('tr');
   if (!tr) return;
-
-  // 备注单元格 → 编辑
   const noteCell = ev.target.closest('.note-cell');
   if (noteCell) {
     ev.stopPropagation();
     startEditNote(noteCell);
     return;
   }
-
-  // 复选框 → 由浏览器切换状态，同步 .selected
   if (ev.target.closest('.row-check')) {
     const cb = ev.target;
     tr.classList.toggle('selected', cb.checked);
     updateCheckAll();
     return;
   }
-
-  // 双击检测
   const now = Date.now();
   const isDbl = (now - lastClickTime < 350) && lastClickRow === tr;
   lastClickTime = now;
   lastClickRow = tr;
 
   if (isDbl) {
-    // 双击打开
     const path = tr.dataset.path, isDir = tr.dataset.dir === '1';
     if (isDir) loadFiles(path);
     else openEditor(path, tr.dataset.name);
     return;
   }
 
-  // 单击选中
   const isMulti = ev.ctrlKey || ev.metaKey;
   const cb = tr.querySelector('.row-check');
-
   if (isMulti) {
-    // Ctrl+单击：切换当前行
     cb.checked = !cb.checked;
     tr.classList.toggle('selected', cb.checked);
   } else {
-    // 普通单击：清除其他，只选中当前
     $$('.row-check', fileListEl).forEach(other => {
       other.checked = false;
       other.closest('tr').classList.remove('selected');
@@ -3008,7 +3488,6 @@ fileListEl.addEventListener('click', ev => {
   updateCheckAll();
 });
 
-/* 编辑备注 */
 function startEditNote(cell) {
   if (cell.querySelector('input')) return;
   const path = cell.dataset.path;
@@ -3062,7 +3541,6 @@ function getCheckedPaths() {
     .map(cb => cb.closest('tr').dataset.path);
 }
 
-/* 右键菜单 */
 const ctxMenu = $('#ctx-menu');
 document.addEventListener('click', () => ctxMenu.classList.remove('show'));
 document.addEventListener('contextmenu', e => {
@@ -3247,16 +3725,13 @@ $('#btn-batch-del').addEventListener('click', async () => {
   else toast(res.msg, 'error');
 });
 
-/* Windows 风格文件管理快捷键 */
+/* Windows 风格快捷键 */
 let keyboardAnchorIndex = null;
 function fileShortcutsEnabled() {
   if (!$('#view-files').classList.contains('active')) return false;
   if ($$('.modal:not([hidden])').length) return false;
   const active = document.activeElement;
-  // 输入框、编辑器、路径编辑框等保留浏览器/文本编辑器自身快捷键。
-  if (active && (active.matches('input, textarea, select, [contenteditable="true"]') || active.isContentEditable)) {
-    return false;
-  }
+  if (active && (active.matches('input, textarea, select, [contenteditable="true"]') || active.isContentEditable)) return false;
   return true;
 }
 function applyRowSelection(indices) {
@@ -3291,13 +3766,11 @@ async function createDirectoryFromShortcut() {
 }
 document.addEventListener('keydown', async e => {
   if (!fileShortcutsEnabled()) return;
-
   const key = (e.key || '').toLowerCase();
   const mod = e.ctrlKey || e.metaKey;
   const selected = getCheckedPaths();
   const rows = Array.from(fileListEl.querySelectorAll('tr'));
 
-  // Ctrl+A：全选当前显示的条目（搜索过滤后仅选择匹配项）。
   if (mod && !e.shiftKey && !e.altKey && key === 'a') {
     if (!rows.length) return;
     e.preventDefault();
@@ -3305,8 +3778,6 @@ document.addEventListener('keydown', async e => {
     keyboardAnchorIndex = 0;
     return;
   }
-
-  // Ctrl+C / Ctrl+X / Ctrl+V：面板内部复制、剪切、粘贴。
   if (mod && !e.shiftKey && !e.altKey && (key === 'c' || key === 'x')) {
     if (!selected.length) return;
     e.preventDefault();
@@ -3320,37 +3791,24 @@ document.addEventListener('keydown', async e => {
     await pasteFileClipboard();
     return;
   }
-
-  // Ctrl+Alt+N：新建文件夹（避开 Chrome 的 Ctrl+Shift+N 无痕窗口快捷键）。
   if (mod && e.altKey && !e.shiftKey && key === 'n') {
     e.preventDefault();
     await createDirectoryFromShortcut();
     return;
   }
-
-  // Ctrl+F：聚焦面板内的文件名搜索框。
   if (mod && !e.shiftKey && !e.altKey && key === 'f') {
     e.preventDefault();
     searchBox.focus();
     searchBox.select();
     return;
   }
-
-  if (e.key === 'Delete' && selected.length) {
-    e.preventDefault();
-    $('#btn-batch-del').click();
-    return;
-  }
-
-  // F2：重命名单个选中项。
+  if (e.key === 'Delete' && selected.length) { e.preventDefault(); $('#btn-batch-del').click(); return; }
   if (e.key === 'F2' && selected.length === 1) {
     e.preventDefault();
     const entry = allEntries.find(item => item.path === selected[0]);
     if (entry) await renameEntry(entry.path, entry.name);
     return;
   }
-
-  // Enter：打开单个选中项；目录进入目录，文件使用内置编辑器打开。
   if (e.key === 'Enter' && selected.length === 1) {
     if (e.target && e.target.closest('button, a, [role="button"]')) return;
     e.preventDefault();
@@ -3361,13 +3819,7 @@ document.addEventListener('keydown', async e => {
     }
     return;
   }
-
-  // F5：刷新当前目录；Alt+↑：进入上级目录。
-  if (e.key === 'F5') {
-    e.preventDefault();
-    loadFiles(currentPath);
-    return;
-  }
+  if (e.key === 'F5') { e.preventDefault(); loadFiles(currentPath); return; }
   if (e.altKey && e.key === 'ArrowUp') {
     if (!currentPath) return;
     e.preventDefault();
@@ -3376,8 +3828,6 @@ document.addEventListener('keydown', async e => {
     loadFiles(parts.join('/'));
     return;
   }
-
-  // ↑ / ↓：在文件列表中移动选择；按住 Shift 可扩展范围。
   if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && rows.length) {
     const selectedIndex = rows.findIndex(tr => tr.querySelector('.row-check')?.checked);
     const direction = e.key === 'ArrowDown' ? 1 : -1;
@@ -3397,13 +3847,8 @@ document.addEventListener('keydown', async e => {
     rows[nextIndex].scrollIntoView({ block: 'nearest' });
     return;
   }
-
-  // Esc：关闭右键菜单，或清空文件选择。
   if (e.key === 'Escape') {
-    if (ctxMenu.classList.contains('show')) {
-      ctxMenu.classList.remove('show');
-      return;
-    }
+    if (ctxMenu.classList.contains('show')) { ctxMenu.classList.remove('show'); return; }
     if (selected.length) {
       e.preventDefault();
       applyRowSelection([]);
@@ -3424,24 +3869,18 @@ async function uploadOneFile(file, targetPath = currentPath, batchProgress = nul
     const xhr = new XMLHttpRequest();
     const tp = batchProgress ? null : toastProgress(`上传：${file.name}（${humanSize(file.size)}）`);
     if (batchProgress) batchProgress.start(relativePath, index, file.size);
-
     xhr.upload.addEventListener('progress', e => {
       if (!e.lengthComputable) return;
       if (batchProgress) batchProgress.progress(e.loaded);
       else tp.set(Math.round((e.loaded / e.total) * 100), e.loaded, e.total);
     });
-
     xhr.addEventListener('load', () => {
-      const completeProgress = () => {
-        if (batchProgress) batchProgress.complete(file.size);
-      };
+      const completeProgress = () => { if (batchProgress) batchProgress.complete(file.size); };
       if (xhr.status === 200) {
         try {
           const res = JSON.parse(xhr.responseText);
-          if (res.code === 0) {
-            if (batchProgress) completeProgress(); else tp.done();
-            resolve({ ok: true });
-          } else {
+          if (res.code === 0) { if (batchProgress) completeProgress(); else tp.done(); resolve({ ok: true }); }
+          else {
             if (batchProgress) completeProgress(); else tp.fail(res.msg || '失败');
             if (res.code === 507 && !batchProgress) toast(res.msg, 'error', 6000);
             resolve({ ok: false, msg: res.msg || '上传失败' });
@@ -3475,7 +3914,6 @@ async function uploadOneFile(file, targetPath = currentPath, batchProgress = nul
     xhr.send(file);
   });
 }
-
 function safeUploadParts(relativePath) {
   const parts = String(relativePath || '').replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
   if (!parts.length || parts.some(part => part === '.' || part === '..' || part.includes('\\') || part.includes('\0'))) {
@@ -3483,16 +3921,12 @@ function safeUploadParts(relativePath) {
   }
   return parts;
 }
-
 async function ensureUploadDirectory(basePath, relativeDir) {
-  // 目录按层级从浅到深创建，因此每次只需创建当前目录，避免反复请求已有父目录。
   const parts = safeUploadParts(relativeDir);
   const name = parts.pop();
   const parent = [basePath || '', parts.join('/')].filter(Boolean).join('/');
   const nextPath = [parent, name].filter(Boolean).join('/');
-  const res = await api('/api/files/mkdir', {
-    method: 'POST', body: { path: parent, name }
-  });
+  const res = await api('/api/files/mkdir', { method: 'POST', body: { path: parent, name } });
   if (res.code !== 0) {
     if (res.msg !== '已存在') throw new Error(res.msg || `无法创建目录：${nextPath}`);
     const check = await api('/api/files?path=' + encodeURIComponent(nextPath));
@@ -3500,7 +3934,6 @@ async function ensureUploadDirectory(basePath, relativeDir) {
   }
   return nextPath;
 }
-
 async function runUploadQueue(items, directories = [], basePath = currentPath) {
   if (!items.length && !directories.length) return;
   const totalSize = items.reduce((sum, item) => sum + (item.file?.size || 0), 0);
@@ -3511,8 +3944,6 @@ async function runUploadQueue(items, directories = [], basePath = currentPath) {
       `继续上传可能会中途失败，是否继续？`, 'alert-triangle');
     if (!ok) return;
   }
-
-  // 先按层级创建文件夹，保留拖入目录的相对结构，也保留空文件夹。
   const allDirs = new Set(directories);
   try {
     for (const item of items) {
@@ -3520,20 +3951,14 @@ async function runUploadQueue(items, directories = [], basePath = currentPath) {
       parts.pop();
       for (let i = 1; i <= parts.length; i++) allDirs.add(parts.slice(0, i).join('/'));
     }
-  } catch (e) {
-    toast('无法上传：' + e.message, 'error', 5000);
-    return;
-  }
+  } catch (e) { toast('无法上传：' + e.message, 'error', 5000); return; }
   const orderedDirs = Array.from(allDirs).filter(Boolean).sort((a, b) => {
     const depth = a.split('/').length - b.split('/').length;
     return depth || a.localeCompare(b);
   });
   try {
     for (const dir of orderedDirs) await ensureUploadDirectory(basePath, dir);
-  } catch (e) {
-    toast('创建上传目录失败：' + e.message, 'error', 5000);
-    return;
-  }
+  } catch (e) { toast('创建上传目录失败：' + e.message, 'error', 5000); return; }
 
   let okCount = 0, failCount = 0;
   const uploadProgress = items.length ? toastBatchUpload(items.length, totalSize) : null;
@@ -3543,9 +3968,8 @@ async function runUploadQueue(items, directories = [], basePath = currentPath) {
     let targetPath = basePath || '';
     try {
       const parts = safeUploadParts(item.relativePath);
-      parts.pop(); // 文件名由 upload_stream 使用 File 对象自带的 name。
+      parts.pop();
       if (parts.length) targetPath = [basePath, parts.join('/')].filter(Boolean).join('/');
-      // 全批次复用同一个进度提示，防止每个文件各弹出一条进度条。
       const result = await uploadOneFile(item.file, targetPath, uploadProgress, item.relativePath, i + 1);
       if (result.ok) okCount++;
       else {
@@ -3567,6 +3991,68 @@ async function runUploadQueue(items, directories = [], basePath = currentPath) {
   }
 }
 
+function toastBatchUpload(totalFiles, totalSize) {
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.innerHTML = `<div class="title"></div>
+    <div class="prog"><div class="bar"></div></div>
+    <div class="pct"><span class="cur">0%</span><span class="total"></span></div>`;
+  $('#toast-wrap').appendChild(el);
+  const titleEl = el.querySelector('.title');
+  const barEl = el.querySelector('.bar');
+  const pctEl = el.querySelector('.cur');
+  const totalEl = el.querySelector('.total');
+  let completed = 0, bytesDone = 0, currentLoaded = 0, currentFileSize = 0;
+  function update() {
+    const sent = Math.min(totalSize, bytesDone + currentLoaded);
+    let pct = totalSize > 0 ? Math.round(sent / totalSize * 100)
+                            : Math.round(completed / Math.max(1, totalFiles) * 100);
+    pct = Math.max(0, Math.min(100, pct));
+    barEl.style.width = pct + '%';
+    pctEl.textContent = pct + '%';
+    totalEl.textContent = totalSize > 0
+      ? `${humanSize(sent)} / ${humanSize(totalSize)} · ${completed}/${totalFiles} 个文件`
+      : `${completed}/${totalFiles} 个文件`;
+  }
+  return {
+    start(relativePath, index, fileSize) {
+      currentLoaded = 0;
+      currentFileSize = Math.max(0, Number(fileSize) || 0);
+      titleEl.textContent = `上传中 ${index}/${totalFiles}：${relativePath}`;
+      update();
+    },
+    progress(loaded) { currentLoaded = Math.min(currentFileSize, Math.max(0, Number(loaded) || 0)); update(); },
+    complete(sentBytes = currentLoaded) {
+      const sent = Math.min(currentFileSize, Math.max(currentLoaded, Number(sentBytes) || 0));
+      bytesDone = Math.min(totalSize, bytesDone + sent);
+      completed = Math.min(totalFiles, completed + 1);
+      currentLoaded = 0; currentFileSize = 0;
+      titleEl.textContent = `已处理 ${completed}/${totalFiles} 个文件`;
+      update();
+    },
+    skip(relativePath, index) {
+      titleEl.textContent = `跳过 ${index}/${totalFiles}：${relativePath}`;
+      completed = Math.min(totalFiles, completed + 1);
+      currentLoaded = 0; currentFileSize = 0;
+      update();
+    },
+    finish(okCount, failCount) {
+      el.classList.add(failCount ? 'error' : 'ok');
+      titleEl.textContent = failCount
+        ? `上传结束：成功 ${okCount} 个，失败 ${failCount} 个`
+        : `上传完成：${okCount} 个文件`;
+      if (!failCount) barEl.style.width = '100%';
+      pctEl.textContent = failCount ? '已结束' : '完成';
+      totalEl.textContent = `${okCount} 成功 · ${failCount} 失败 · 共 ${totalFiles} 个文件`;
+      setTimeout(() => {
+        el.style.transition = 'opacity .3s, transform .3s';
+        el.style.opacity = '0'; el.style.transform = 'translateY(-16px)';
+        setTimeout(() => el.remove(), 320);
+      }, failCount ? 5000 : 1400);
+    }
+  };
+}
+
 $('#file-input').addEventListener('change', async ev => {
   const files = Array.from(ev.target.files || []);
   if (!files.length) return;
@@ -3575,7 +4061,6 @@ $('#file-input').addEventListener('change', async ev => {
   ev.target.value = '';
 });
 
-// Chrome/Edge 支持通过 webkitGetAsEntry 遍历拖入的目录内容。
 function readDirectoryEntries(dirEntry) {
   return new Promise((resolve, reject) => {
     const reader = dirEntry.createReader();
@@ -3587,7 +4072,6 @@ function readDirectoryEntries(dirEntry) {
     readBatch();
   });
 }
-
 async function collectDropEntry(entry, parentPath, result) {
   const relativePath = parentPath ? parentPath + '/' + entry.name : entry.name;
   if (entry.isFile) {
@@ -3601,7 +4085,6 @@ async function collectDropEntry(entry, parentPath, result) {
     for (const child of children) await collectDropEntry(child, relativePath, result);
   }
 }
-
 const fileDropZone = $('#file-table-wrap');
 let fileDragDepth = 0;
 function dragHasFiles(ev) {
@@ -3629,8 +4112,7 @@ fileDropZone.addEventListener('dragleave', ev => {
 });
 fileDropZone.addEventListener('drop', async ev => {
   if (!dragHasFiles(ev)) return;
-  ev.preventDefault();
-  ev.stopPropagation();
+  ev.preventDefault(); ev.stopPropagation();
   fileDragDepth = 0;
   fileDropZone.classList.remove('drag-over');
   const basePath = currentPath;
@@ -3639,7 +4121,6 @@ fileDropZone.addEventListener('drop', async ev => {
   const items = Array.from(transfer.items || []).filter(item => item.kind === 'file');
   let usedEntries = false;
   try {
-    // 必须在 drop 事件同步阶段取出所有 entry，再异步递归读取目录。
     const entries = [];
     for (const item of items) {
       const entry = typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null;
@@ -3647,18 +4128,14 @@ fileDropZone.addEventListener('drop', async ev => {
     }
     usedEntries = entries.length > 0;
     for (const entry of entries) await collectDropEntry(entry, '', result);
-  } catch (e) {
-    toast('读取拖入的文件/文件夹失败：' + e.message, 'error', 5000);
-    return;
-  }
+  } catch (e) { toast('读取拖入的文件/文件夹失败：' + e.message, 'error', 5000); return; }
   if (!usedEntries) {
     result.files = Array.from(transfer.files || []).map(file => ({
       file, relativePath: file.webkitRelativePath || file.name
     }));
   }
   if (!result.files.length && !result.directories.size) {
-    toast('没有识别到可上传的文件或文件夹', 'warn');
-    return;
+    toast('没有识别到可上传的文件或文件夹', 'warn'); return;
   }
   await runUploadQueue(result.files, Array.from(result.directories), basePath);
 });
@@ -3841,6 +4318,334 @@ $('#editor-area').addEventListener('keydown', e => {
     ta.value = ta.value.slice(0, s) + '    ' + ta.value.slice(en);
     ta.selectionStart = ta.selectionEnd = s + 4;
   }
+});
+
+/* ============================================================
+   计划任务
+   ============================================================ */
+let cronCache = [];
+let currentCronId = null;
+let currentLogCronId = null;
+
+async function loadCronTasks() {
+  try {
+    const res = await api('/api/cron/tasks');
+    if (res.code !== 0) { toast(res.msg, 'error'); return; }
+    cronCache = res.data || [];
+    $('#cron-count').textContent = `共 ${cronCache.length} 个任务`;
+    const list = $('#cron-list'); list.innerHTML = '';
+    $('#cron-empty').hidden = cronCache.length > 0;
+    cronCache.forEach(t => {
+      const tr = document.createElement('tr');
+      tr.dataset.id = t.id;
+      const isPy = t.task_type === 'python';
+      const typeTag = isPy
+        ? `<span class="cron-type-tag py">PY</span>`
+        : `<span class="cron-type-tag">SH</span>`;
+      // 状态列
+      const statusCol = `<label class="cron-toggle" title="${t.enabled ? '点击停用' : '点击启用'}">
+        <input type="checkbox" class="cron-enabled" ${t.enabled ? 'checked' : ''}>
+        <span class="slider"></span>
+      </label>`;
+      // 上次结果
+      let lastRes = '<span style="color:var(--muted)">-</span>';
+      if (t.last_status === 'running') lastRes = '<span style="color:var(--warn)">运行中</span>';
+      else if (t.last_status === 'success') lastRes = '<span style="color:var(--ok)">成功</span>';
+      else if (t.last_status === 'failed') lastRes = '<span style="color:var(--danger)">失败</span>';
+      const lastRun = t.last_run ? fmtTime(t.last_run) : '从未';
+      tr.innerHTML = `
+        <td>${typeTag}</td>
+        <td><div class="name-cell"><span class="name" title="${esc(t.name)}">${esc(t.name)}</span></div></td>
+        <td>${statusCol}</td>
+        <td>${esc(t.schedule_desc || '-')}</td>
+        <td class="w-time">${esc(lastRun)}</td>
+        <td>${lastRes}</td>
+        <td><div style="display:flex;gap:4px;flex-wrap:nowrap;justify-content:center">
+          <button class="btn tiny primary" data-act="run">立即执行</button>
+          <button class="btn tiny" data-act="edit">编辑</button>
+          <button class="btn tiny" data-act="log">日志</button>
+          <button class="btn tiny danger" data-act="delete">删除</button>
+        </div></td>`;
+      list.appendChild(tr);
+    });
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+$('#btn-refresh-cron').addEventListener('click', loadCronTasks);
+$('#btn-add-cron').addEventListener('click', () => openCronModal(null));
+
+async function openCronModal(task) {
+  // 加载系统用户列表
+  const ug = await api('/api/system/users_groups');
+  const userSel = $('#cron-user');
+  userSel.innerHTML = '';
+  if (ug.code === 0) {
+    ug.data.users.forEach(u => {
+      const o = document.createElement('option');
+      o.value = u.name; o.textContent = u.name + (u.uid === 0 ? '（root）' : '');
+      userSel.appendChild(o);
+    });
+  } else {
+    const o = document.createElement('option'); o.value = 'root'; o.textContent = 'root';
+    userSel.appendChild(o);
+  }
+
+  if (task) {
+    currentCronId = task.id;
+    $('#cron-modal-title').textContent = '编辑计划任务';
+    $('#cron-type').value = task.task_type || 'shell';
+    $('#cron-name').value = task.name || '';
+    $('#cron-use-lock').checked = !!task.use_lock;
+    $('#cron-script').value = task.script || '';
+    userSel.value = task.run_user || 'root';
+    const sched = task.schedule || {};
+    $('#cron-sched-type').value = sched.type || 'daily';
+    renderScheduleParams(sched.type || 'daily', sched);
+  } else {
+    currentCronId = null;
+    $('#cron-modal-title').textContent = '添加计划任务';
+    $('#cron-type').value = 'shell';
+    $('#cron-name').value = '';
+    $('#cron-use-lock').checked = true;
+    $('#cron-script').value = '';
+    userSel.value = 'root';
+    $('#cron-sched-type').value = 'daily';
+    renderScheduleParams('daily', { hour: 1, minute: 30 });
+  }
+  $('#cron-modal').hidden = false;
+}
+
+function _opts(min, max, pad = true) {
+  let html = '';
+  for (let i = min; i <= max; i++) {
+    const v = pad ? String(i).padStart(2, '0') : String(i);
+    html += `<option value="${i}">${v}</option>`;
+  }
+  return html;
+}
+
+function renderScheduleParams(type, values = {}) {
+  const box = $('#cron-sched-params');
+  const v = values || {};
+  const hoursOpts  = _opts(0, 23);
+  const minsOpts   = _opts(0, 59);
+  const weekOpts   = ['周日','周一','周二','周三','周四','周五','周六']
+    .map((n, i) => `<option value="${i}">${n}</option>`).join('');
+  const mdOpts     = _opts(1, 31, false);
+
+  if (type === 'daily') {
+    box.innerHTML = `
+      <select class="mini" id="sched-hour">${hoursOpts}</select><span>时</span>
+      <select class="mini" id="sched-minute">${minsOpts}</select><span>分</span>`;
+    $('#sched-hour').value   = Number(v.hour   ?? 1);
+    $('#sched-minute').value = Number(v.minute ?? 30);
+  } else if (type === 'hourly') {
+    box.innerHTML = `
+      <select class="mini" id="sched-minute">${minsOpts}</select><span>分</span>`;
+    $('#sched-minute').value = Number(v.minute ?? 0);
+  } else if (type === 'n_minutes') {
+    box.innerHTML = `每 <input type="number" class="mini" id="sched-n" value="${Number(v.n ?? 5)}" min="1" max="59"><span>分钟</span>`;
+  } else if (type === 'n_hours') {
+    box.innerHTML = `每 <input type="number" class="mini" id="sched-n" value="${Number(v.n ?? 1)}" min="1" max="23"><span>小时</span>`;
+  } else if (type === 'weekly') {
+    box.innerHTML = `
+      <select class="mini" id="sched-weekday">${weekOpts}</select>
+      <select class="mini" id="sched-hour">${hoursOpts}</select><span>时</span>
+      <select class="mini" id="sched-minute">${minsOpts}</select><span>分</span>`;
+    $('#sched-weekday').value = Number(v.weekday ?? 1);
+    $('#sched-hour').value    = Number(v.hour ?? 1);
+    $('#sched-minute').value  = Number(v.minute ?? 30);
+  } else if (type === 'monthly') {
+    box.innerHTML = `
+      每月 <select class="mini" id="sched-monthday">${mdOpts}</select><span>号</span>
+      <select class="mini" id="sched-hour">${hoursOpts}</select><span>时</span>
+      <select class="mini" id="sched-minute">${minsOpts}</select><span>分</span>`;
+    $('#sched-monthday').value = Number(v.monthday ?? 1);
+    $('#sched-hour').value     = Number(v.hour ?? 1);
+    $('#sched-minute').value   = Number(v.minute ?? 30);
+  } else if (type === 'custom') {
+    box.innerHTML = `<input type="text" id="sched-cron" value="${esc(v.cron || '0 1 * * *')}" style="min-width:220px;font-family:ui-monospace,monospace;font-size:13px" placeholder="0 1 * * *">`;
+  }
+  updateCronSchedDesc();
+}
+
+function collectCronSchedule() {
+  const t = $('#cron-sched-type').value;
+  const s = { type: t };
+  const v = id => { const el = $('#' + id); return el ? el.value : ''; };
+  const toI = (x, d) => { const n = parseInt(x, 10); return isNaN(n) ? d : n; };
+  if (t === 'daily') {
+    s.hour = toI(v('sched-hour'), 0);
+    s.minute = toI(v('sched-minute'), 0);
+  } else if (t === 'hourly') {
+    s.minute = toI(v('sched-minute'), 0);
+  } else if (t === 'n_minutes' || t === 'n_hours') {
+    s.n = toI(v('sched-n'), 1);
+  } else if (t === 'weekly') {
+    s.weekday = toI(v('sched-weekday'), 1);
+    s.hour = toI(v('sched-hour'), 0);
+    s.minute = toI(v('sched-minute'), 0);
+  } else if (t === 'monthly') {
+    s.monthday = toI(v('sched-monthday'), 1);
+    s.hour = toI(v('sched-hour'), 0);
+    s.minute = toI(v('sched-minute'), 0);
+  } else if (t === 'custom') {
+    s.cron = (v('sched-cron') || '').trim();
+  }
+  return s;
+}
+
+function updateCronSchedDesc() {
+  const s = collectCronSchedule();
+  const pad = n => String(n).padStart(2, '0');
+  const weekNames = ['周日','周一','周二','周三','周四','周五','周六'];
+  let desc = '';
+  switch (s.type) {
+    case 'daily':    desc = `每天的 ${pad(s.hour)}:${pad(s.minute)} 执行一次`; break;
+    case 'hourly':   desc = `每小时的 ${pad(s.minute)} 分执行一次`; break;
+    case 'n_minutes':desc = `每 ${s.n} 分钟执行一次`; break;
+    case 'n_hours':  desc = `每 ${s.n} 小时执行一次`; break;
+    case 'weekly':   desc = `每${weekNames[s.weekday]} ${pad(s.hour)}:${pad(s.minute)} 执行一次`; break;
+    case 'monthly':  desc = `每月 ${s.monthday} 号 ${pad(s.hour)}:${pad(s.minute)} 执行一次`; break;
+    case 'custom':   desc = `cron 表达式：${s.cron || '(未填写)'}`; break;
+  }
+  $('#cron-sched-desc').textContent = desc;
+}
+
+$('#cron-sched-type').addEventListener('change', () => {
+  const t = $('#cron-sched-type').value;
+  const defaults = { hour: 1, minute: 30, n: 5, weekday: 1, monthday: 1, cron: '0 1 * * *' };
+  renderScheduleParams(t, defaults);
+});
+
+// 给周期参数里的所有控件挂 change/input 事件
+$('#cron-sched-params').addEventListener('input', updateCronSchedDesc);
+$('#cron-sched-params').addEventListener('change', updateCronSchedDesc);
+
+$('#cron-save').addEventListener('click', async () => {
+  const name = $('#cron-name').value.trim();
+  const task_type = $('#cron-type').value;
+  const run_user = $('#cron-user').value || 'root';
+  const schedule = collectCronSchedule();
+  const script = $('#cron-script').value;
+  const use_lock = $('#cron-use-lock').checked;
+
+  if (!name) { toast('请填写任务名称', 'error'); return; }
+  if (!script.trim()) { toast('请填写脚本内容', 'error'); return; }
+  if (schedule.type === 'custom' && !schedule.cron) {
+    toast('请填写自定义 cron 表达式', 'error'); return;
+  }
+
+  const payload = {
+    name, task_type, run_user, schedule, script,
+    use_lock, enabled: true,
+  };
+  const btn = $('#cron-save'); btn.disabled = true; btn.textContent = '保存中…';
+  try {
+    let res;
+    if (currentCronId) {
+      res = await api('/api/cron/tasks/' + currentCronId, { method: 'PUT', body: payload });
+    } else {
+      res = await api('/api/cron/tasks', { method: 'POST', body: payload });
+    }
+    if (res.code === 0) {
+      toast(res.msg || '已保存', 'ok');
+      $('#cron-modal').hidden = true;
+      loadCronTasks();
+    } else {
+      toast(res.msg, 'error', 4000);
+    }
+  } finally {
+    btn.disabled = false; btn.textContent = '确定';
+  }
+});
+
+$('#cron-list').addEventListener('click', async ev => {
+  const tr = ev.target.closest('tr');
+  if (!tr) return;
+  const id = parseInt(tr.dataset.id, 10);
+  const task = cronCache.find(t => t.id === id);
+  if (!task) return;
+
+  // 滑块切换
+  if (ev.target.classList.contains('cron-enabled')) {
+    const newState = ev.target.checked;
+    const res = await api(`/api/cron/tasks/${id}/toggle`, {
+      method: 'POST', body: { enabled: newState }
+    });
+    if (res.code === 0) {
+      toast(res.msg || '已切换', 'ok');
+      loadCronTasks();
+    } else {
+      toast(res.msg, 'error');
+      ev.target.checked = !newState;
+    }
+    return;
+  }
+
+  const btn = ev.target.closest('button[data-act]');
+  if (!btn) return;
+  const act = btn.dataset.act;
+
+  if (act === 'run') {
+    btn.disabled = true;
+    const res = await api(`/api/cron/tasks/${id}/run`, { method: 'POST' });
+    if (res.code === 0) {
+      toast(res.msg || '已启动', 'ok');
+      setTimeout(loadCronTasks, 500);
+    } else {
+      toast(res.msg, 'error', 4000);
+    }
+    btn.disabled = false;
+  } else if (act === 'edit') {
+    openCronModal(task);
+  } else if (act === 'log') {
+    openCronLog(task);
+  } else if (act === 'delete') {
+    const ok = await showConfirm('删除计划任务',
+      `确定要删除「${task.name}」吗？\n该任务的 crontab 与脚本会被同时清除。`, 'trash-2');
+    if (!ok) return;
+    const res = await api(`/api/cron/tasks/${id}`, { method: 'DELETE' });
+    if (res.code === 0) { toast('已删除', 'ok'); loadCronTasks(); }
+    else toast(res.msg, 'error');
+  }
+});
+
+async function openCronLog(task) {
+  currentLogCronId = task.id;
+  $('#cron-log-title').textContent = '任务日志：' + task.name;
+  $('#cron-log-meta').textContent = '正在加载…';
+  $('#cron-log-area').value = '';
+  $('#cron-log-modal').hidden = false;
+  try {
+    const res = await api(`/api/cron/tasks/${task.id}/log`);
+    if (res.code !== 0) {
+      $('#cron-log-meta').textContent = res.msg;
+      return;
+    }
+    const d = res.data;
+    $('#cron-log-area').value = d.content || '(暂无日志)';
+    const sizeTxt = d.size ? humanSize(d.size) : '0 B';
+    $('#cron-log-meta').textContent =
+      `日志大小 ${sizeTxt}` + (d.truncated ? ' · 只显示最后 512KB' : '');
+    // 滚动到最底部
+    const ta = $('#cron-log-area');
+    ta.scrollTop = ta.scrollHeight;
+  } catch (e) {
+    $('#cron-log-meta').textContent = e.message;
+  }
+}
+
+$('#cron-log-clear').addEventListener('click', async () => {
+  if (!currentLogCronId) return;
+  const ok = await showConfirm('清空日志', '确定清空该任务的日志文件吗？', 'trash-2');
+  if (!ok) return;
+  const res = await api(`/api/cron/tasks/${currentLogCronId}/log`, { method: 'DELETE' });
+  if (res.code === 0) {
+    toast('已清空', 'ok');
+    $('#cron-log-area').value = '';
+    $('#cron-log-meta').textContent = '日志大小 0 B';
+  } else toast(res.msg, 'error');
 });
 
 /* ============================================================
@@ -4260,6 +5065,7 @@ $('#fw-list').addEventListener('click', async ev => {
 loadFiles('');
 loadKeys(true);
 loadSshService();
+loadCronTasks();
 refreshBitsOptions();
 </script>
 </body>
@@ -4290,12 +5096,25 @@ def check_ufw():
         print("⚠️  未检测到 ufw，防火墙功能不可用")
         print("   安装：sudo apt install -y ufw\n")
 
+def check_cron_d():
+    """检查 /etc/cron.d 是否存在，不存在则提示（某些精简系统可能没有 cron）"""
+    if not os.path.isdir(CRON_DIR):
+        print(f"⚠️  未检测到 {CRON_DIR} 目录，计划任务可能无法工作")
+        print("   安装 cron：sudo apt install -y cron && sudo systemctl enable --now cron\n")
+
 if __name__ == "__main__":
-    require_root()          # 必须在最前面，其他初始化之前
+    require_root()
     print("\n面板启动中…")
     check_ufw()
+    check_cron_d()
+    # 启动时重建所有已启用任务的 cron 文件
+    try:
+        sync_all_cron_files()
+    except Exception as e:
+        print(f"⚠️  同步计划任务失败：{e}")
     print(f"📡 http://{HOST}:{PORT}")
     print(f"📂 文件根目录: {FILE_ROOT}")
     print(f"📄 日志: {LOG_FILE}")
+    print(f"⏰ 计划任务: {TASK_DIR}")
     socketio.run(app, host=HOST, port=PORT, debug=False,
                  allow_unsafe_werkzeug=True)
