@@ -9,6 +9,8 @@
 
 # ----------------------------- 基本配置 -------------------------------------
 REPO_URL="https://github.com/hia1321/linux-panel.git"
+REPO_PATH="hia1321/linux-panel"          # 供 CDN 镜像使用
+REPO_BRANCH="main"
 INSTALL_DIR="/opt/linux-panel"
 SERVICE_NAME="linux-panel"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -29,11 +31,37 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[✗]${NC} $*" >&2; }
 
 # =============================================================================
+#  0. GitHub 镜像回退克隆（国内服务器必备）
+# =============================================================================
+clone_repo() {
+    local target="$1"
+    local urls=(
+        "https://github.com/${REPO_PATH}.git"
+        "https://ghfast.top/https://github.com/${REPO_PATH}.git"
+        "https://ghproxy.net/https://github.com/${REPO_PATH}.git"
+        "https://hub.gitmirror.com/https://github.com/${REPO_PATH}.git"
+        "https://gitclone.com/github.com/${REPO_PATH}.git"
+    )
+    for url in "${urls[@]}"; do
+        info "尝试克隆：$url"
+        if timeout 180 git clone --depth 1 -b "$REPO_BRANCH" "$url" "$target" 2>/dev/null; then
+            log "克隆成功：$url"
+            return 0
+        fi
+        warn "失败：$url"
+        rm -rf "$target"
+    done
+    return 1
+}
+
+# =============================================================================
 #  1. 权限检查：必须以 root 身份运行
 # =============================================================================
 if [[ $EUID -ne 0 ]]; then
     err "本安装脚本必须以 root 身份运行。"
-    err "请使用：sudo bash $0"
+    err "推荐流程（避开终端 /dev/fd 兼容问题和 GitHub 直连问题）："
+    err "  curl -fsSL https://cdn.jsdelivr.net/gh/${REPO_PATH}@${REPO_BRANCH}/install.sh -o /tmp/install.sh"
+    err "  sudo bash /tmp/install.sh"
     exit 1
 fi
 
@@ -85,7 +113,7 @@ install_pkg_if_missing python3 python3
 install_pkg_if_missing pip3 python3-pip
 
 # =============================================================================
-#  3.1 关键修复：确保 venv 可用（精简版，不装 python3-full）
+#  3.1 确保 python3-venv 可用（精简安装，不装 python3-full）
 # =============================================================================
 if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || ! "$PYTHON_BIN" -m ensurepip --version >/dev/null 2>&1; then
     warn "检测到 python3-venv 或 ensurepip 缺失（Ubuntu/Debian 常见问题）。"
@@ -93,7 +121,6 @@ if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || ! "$PYTHON_BIN" -m ensurepi
     if [[ ! "${ans:-Y}" =~ ^[Nn]$ ]]; then
         apt-get update -qq
         PY_VER=$("$PYTHON_BIN" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')
-        # 优先安装精确匹配的 venv，失败则回退到通用包
         apt-get install -y "${PY_VER}-venv" || apt-get install -y python3-venv || true
         log "已尝试安装 python3-venv 相关包。"
     else
@@ -101,6 +128,19 @@ if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || ! "$PYTHON_BIN" -m ensurepi
         exit 1
     fi
 fi
+
+# 二次确认 venv 是否真正可用
+if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
+    err "python3-venv 仍不可用，请手动执行：sudo apt install python3-venv"
+    exit 1
+fi
+
+# 检测可选命令（不阻塞安装）
+for opt in ssh-keygen ufw sshd; do
+    if ! command -v "$opt" >/dev/null 2>&1; then
+        warn "未检测到 ${opt}，面板对应功能可能不可用。"
+    fi
+done
 
 # =============================================================================
 #  4. 克隆 / 更新仓库到 /opt/linux-panel
@@ -116,8 +156,8 @@ if [[ -d "$INSTALL_DIR" ]]; then
     fi
 else
     info "克隆仓库到 ${INSTALL_DIR} ..."
-    if ! git clone "$REPO_URL" "$INSTALL_DIR"; then
-        err "克隆仓库失败，请检查网络。"
+    if ! clone_repo "$INSTALL_DIR"; then
+        err "所有 GitHub 官方源与镜像源均克隆失败，请检查网络。"
         exit 1
     fi
     log "仓库克隆完成。"
@@ -178,7 +218,7 @@ fi
 log "目录权限已收紧。"
 
 # =============================================================================
-#  8. 写入 systemd 服务（修复环境变量传参问题）
+#  8. 写入 systemd 服务
 # =============================================================================
 info "创建 systemd 服务：${SERVICE_FILE}"
 cat > "$SERVICE_FILE" <<EOF
@@ -253,7 +293,8 @@ case "${1:-}" in
             echo "已取消"
             exit 0
         fi
-        systemctl disable --now "$SERVICE" || true
+        systemctl stop "$SERVICE" 2>/dev/null || true
+        rm -f /etc/systemd/system/multi-user.target.wants/${SERVICE}.service
         rm -f /etc/systemd/system/${SERVICE}.service
         systemctl daemon-reload
         rm -f /usr/local/bin/linux-panel
@@ -270,12 +311,12 @@ chmod 755 /usr/local/bin/linux-panel
 log "快捷管理命令已创建。"
 
 # =============================================================================
-#  10. 启动服务（使用手动软链接避免 systemd 报错）
+#  10. 设置开机自启 + 启动服务（用软链接避开 systemd 老版本报错）
 # =============================================================================
 info "重新加载 systemd 并启动服务..."
 systemctl daemon-reload || true
 
-# 手动创建开机自启软链接（比 systemctl enable 兼容性更好）
+# 手动创建开机自启软链接（兼容性比 systemctl enable 更好）
 mkdir -p /etc/systemd/system/multi-user.target.wants
 ln -sf "$SERVICE_FILE" "/etc/systemd/system/multi-user.target.wants/${SERVICE_NAME}.service"
 log "已设置开机自启。"
@@ -284,7 +325,7 @@ log "已设置开机自启。"
 systemctl start "$SERVICE" || warn "服务启动失败，请使用 'sudo linux-panel logs' 查看日志排查。"
 
 # =============================================================================
-#  11. 完成提示
+#  11. 完成提示（一定会输出）
 # =============================================================================
 echo
 echo -e "${GREEN}========================================${NC}"
@@ -296,7 +337,7 @@ echo -e "  访问地址 : ${GREEN}http://<服务器IP>:${PANEL_PORT}${NC}"
 echo -e "  管理命令 : ${YELLOW}sudo linux-panel {start|stop|restart|status|logs|uninstall}${NC}"
 echo
 echo -e "  首次登录密码请查看日志："
-echo -e "  ${YELLOW}sudo journalctl -u linux-panel -n 100 --no-pager${NC}"
+echo -e "  ${YELLOW}sudo journalctl -u linux-panel -n 50 --no-pager${NC}"
 echo
 echo -e "  如果启用了 UFW，请放行面板端口："
 echo -e "  ${YELLOW}sudo ufw allow ${PANEL_PORT}/tcp${NC}"
