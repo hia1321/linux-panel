@@ -4,11 +4,8 @@
 #  强制以 root 身份安装和运行
 #  默认端口：33972
 #  适用系统：Debian / Ubuntu 系
-#  仓库地址：https://github.com/hia1321/linux-panel
 # =============================================================================
 
-# ----------------------------- 基本配置 -------------------------------------
-REPO_URL="https://github.com/hia1321/linux-panel.git"
 REPO_PATH="hia1321/linux-panel"
 REPO_BRANCH="main"
 INSTALL_DIR="/opt/linux-panel"
@@ -18,21 +15,12 @@ PYTHON_BIN="/usr/bin/python3"
 VENV_DIR="${INSTALL_DIR}/venv"
 PANEL_PORT="${PANEL_PORT:-33972}"
 
-# ----------------------------- 颜色输出 -------------------------------------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[✓]${NC} $*"; }
 info() { echo -e "${BLUE}[i]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[✗]${NC} $*" >&2; }
 
-# =============================================================================
-#  0. GitHub 镜像回退克隆
-# =============================================================================
 clone_repo() {
     local target="$1"
     local urls=(
@@ -45,191 +33,109 @@ clone_repo() {
     for url in "${urls[@]}"; do
         info "尝试克隆：$url"
         if timeout 180 git clone --depth 1 -b "$REPO_BRANCH" "$url" "$target" 2>/dev/null; then
-            log "克隆成功：$url"
-            return 0
+            log "克隆成功：$url"; return 0
         fi
-        warn "失败：$url"
-        rm -rf "$target"
+        warn "失败：$url"; rm -rf "$target"
     done
     return 1
 }
 
-# =============================================================================
-#  1. 权限检查：必须以 root 身份运行
-# =============================================================================
+# ---------- 权限 ----------
 if [[ $EUID -ne 0 ]]; then
-    err "本安装脚本必须以 root 身份运行。"
-    err "推荐流程（避开终端 /dev/fd 兼容问题和 GitHub 直连问题）："
-    err "  curl -fsSL https://cdn.jsdelivr.net/gh/${REPO_PATH}@${REPO_BRANCH}/install.sh -o /tmp/install.sh"
+    err "必须以 root 身份运行。推荐流程："
+    err "  curl -fsSL \"https://cdn.jsdelivr.net/gh/${REPO_PATH}@${REPO_BRANCH}/install.sh?t=\$(date +%s)\" -o /tmp/install.sh"
     err "  sudo bash /tmp/install.sh"
     exit 1
 fi
-
-if [[ "$(id -u)" -ne 0 ]]; then
-    err "检测到当前有效用户不是 root，拒绝继续。"
-    exit 1
-fi
-
 log "已确认以 root 身份运行，继续安装..."
 
-# =============================================================================
-#  2. 系统检测
-# =============================================================================
-if ! command -v apt-get >/dev/null 2>&1; then
-    err "本脚本目前仅支持 Debian / Ubuntu 系系统。"
-    exit 1
-fi
+# ---------- 系统检测 ----------
+command -v apt-get >/dev/null 2>&1 || { err "仅支持 Debian / Ubuntu 系"; exit 1; }
+[[ -d /run/systemd/system ]] || { err "未检测到 systemd"; exit 1; }
 
-if [[ ! -d /run/systemd/system ]]; then
-    err "未检测到 systemd，本脚本依赖 systemd 管理服务。"
-    exit 1
-fi
-
-# =============================================================================
-#  3. 交互式安装系统依赖
-# =============================================================================
+# ---------- 系统依赖 ----------
 install_pkg_if_missing() {
-    local cmd="$1"
-    local pkg="${2:-$1}"
+    local cmd="$1" pkg="${2:-$1}"
     if ! command -v "$cmd" >/dev/null 2>&1; then
-        warn "未检测到 ${cmd}。"
-        read -rp "是否安装 ${pkg}？[Y/n] " ans
+        warn "未检测到 ${cmd}。"; read -rp "是否安装 ${pkg}？[Y/n] " ans
         if [[ ! "${ans:-Y}" =~ ^[Nn]$ ]]; then
-            apt-get update -qq
-            apt-get install -y "$pkg" || true
-            log "已尝试安装 ${pkg}"
-        else
-            err "缺少 ${cmd}，无法继续。"
-            exit 1
-        fi
-    else
-        log "已存在 ${cmd}"
-    fi
+            apt-get update -qq; apt-get install -y "$pkg" || true; log "已尝试安装 ${pkg}"
+        else err "缺少 ${cmd}"; exit 1; fi
+    else log "已存在 ${cmd}"; fi
 }
-
 info "检查系统依赖..."
 install_pkg_if_missing git git
 install_pkg_if_missing python3 python3
 install_pkg_if_missing pip3 python3-pip
 
-# =============================================================================
-#  3.1 确保 python3-venv 可用
-# =============================================================================
+# ---------- python3-venv ----------
 if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || ! "$PYTHON_BIN" -m ensurepip --version >/dev/null 2>&1; then
-    warn "检测到 python3-venv 或 ensurepip 缺失（Ubuntu/Debian 常见问题）。"
+    warn "python3-venv / ensurepip 缺失。"
     read -rp "是否自动安装 python3-venv？[Y/n] " ans
     if [[ ! "${ans:-Y}" =~ ^[Nn]$ ]]; then
         apt-get update -qq
         PY_VER=$("$PYTHON_BIN" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')
         apt-get install -y "${PY_VER}-venv" || apt-get install -y python3-venv || true
-        log "已尝试安装 python3-venv 相关包。"
-    else
-        err "缺少 python3-venv，无法创建虚拟环境。"
-        exit 1
-    fi
+    else err "缺少 python3-venv"; exit 1; fi
 fi
 
-if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
-    err "python3-venv 仍不可用，请手动执行：sudo apt install python3-venv"
-    exit 1
-fi
-
-for opt in ssh-keygen ufw sshd; do
-    if ! command -v "$opt" >/dev/null 2>&1; then
-        warn "未检测到 ${opt}，面板对应功能可能不可用。"
-    fi
-done
-
-# =============================================================================
-#  4. 克隆 / 更新仓库
-# =============================================================================
+# ---------- 克隆 ----------
 if [[ -d "$INSTALL_DIR" ]]; then
     if [[ -d "${INSTALL_DIR}/.git" ]]; then
-        info "目录 ${INSTALL_DIR} 已存在，执行 git pull 更新..."
-        git -C "$INSTALL_DIR" pull --ff-only || warn "git pull 失败，跳过更新，继续安装。"
+        info "目录已存在，git pull 更新..."
+        git -C "$INSTALL_DIR" pull --ff-only || warn "更新失败，继续使用现有代码"
     else
-        err "${INSTALL_DIR} 已存在，但不是 git 仓库。"
-        err "请手动删除后再运行本脚本：sudo rm -rf ${INSTALL_DIR}"
-        exit 1
+        err "${INSTALL_DIR} 存在但不是 git 仓库，请先 sudo rm -rf ${INSTALL_DIR}"; exit 1
     fi
 else
     info "克隆仓库到 ${INSTALL_DIR} ..."
-    if ! clone_repo "$INSTALL_DIR"; then
-        err "所有 GitHub 官方源与镜像源均克隆失败，请检查网络。"
-        exit 1
-    fi
+    clone_repo "$INSTALL_DIR" || { err "克隆失败"; exit 1; }
     log "仓库克隆完成。"
 fi
 
 cd "$INSTALL_DIR" || exit 1
 
-# =============================================================================
-#  5. 创建虚拟环境
-# =============================================================================
+# ---------- venv ----------
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
-    info "创建 Python 虚拟环境 ${VENV_DIR} ..."
+    info "创建虚拟环境 ..."
     rm -rf "$VENV_DIR"
-    if ! "$PYTHON_BIN" -m venv "$VENV_DIR"; then
-        err "创建虚拟环境失败，请检查 python3-venv 是否安装正确。"
-        exit 1
-    fi
+    "$PYTHON_BIN" -m venv "$VENV_DIR" || { err "创建 venv 失败"; exit 1; }
     log "虚拟环境创建完成。"
 else
-    log "虚拟环境已存在，跳过创建。"
+    log "虚拟环境已存在。"
 fi
-
 VENV_PY="${VENV_DIR}/bin/python"
 VENV_PIP="${VENV_DIR}/bin/pip"
 
-# =============================================================================
-#  6. 安装 Python 依赖
-# =============================================================================
+# ---------- 依赖 ----------
 if [[ -f requirements.txt ]]; then
-    read -rp "是否安装/更新 requirements.txt 中的 Python 依赖？[Y/n] " ans
+    read -rp "是否安装/更新 Python 依赖？[Y/n] " ans
     if [[ ! "${ans:-Y}" =~ ^[Nn]$ ]]; then
-        info "安装 Python 依赖..."
-        "$VENV_PIP" install --upgrade pip || warn "pip 升级失败，使用现有版本。"
-        "$VENV_PIP" install -r requirements.txt || warn "部分依赖安装失败，服务可能无法启动。"
-        log "Python 依赖处理完成。"
-    else
-        warn "已跳过依赖安装。"
+        info "安装依赖..."
+        "$VENV_PIP" install --upgrade pip || warn "pip 升级失败"
+        "$VENV_PIP" install -r requirements.txt || warn "部分依赖失败"
+        log "依赖处理完成。"
     fi
-else
-    warn "未找到 requirements.txt，跳过依赖安装。"
 fi
 
-# =============================================================================
-#  7. 目录权限收紧
-# =============================================================================
-info "设置安装目录权限为 root:root 700 ..."
+# ---------- 权限 ----------
 chown -R root:root "$INSTALL_DIR" || true
 chmod 700 "$INSTALL_DIR" || true
-if [[ -d "${INSTALL_DIR}/data" ]]; then
-    chmod 700 "${INSTALL_DIR}/data" || true
-fi
-if [[ -f "${INSTALL_DIR}/data/secret.key" ]]; then
-    chmod 600 "${INSTALL_DIR}/data/secret.key" || true
-fi
-if [[ -f "${INSTALL_DIR}/data/panel.db" ]]; then
-    chmod 600 "${INSTALL_DIR}/data/panel.db" || true
-fi
-log "目录权限已收紧。"
+[[ -d "${INSTALL_DIR}/data" ]] && chmod 700 "${INSTALL_DIR}/data" || true
+[[ -f "${INSTALL_DIR}/data/secret.key" ]] && chmod 600 "${INSTALL_DIR}/data/secret.key" || true
+[[ -f "${INSTALL_DIR}/data/panel.db" ]] && chmod 600 "${INSTALL_DIR}/data/panel.db" || true
 
-# =============================================================================
-#  8. 写入环境变量文件
-# =============================================================================
-info "创建环境变量文件：${INSTALL_DIR}/.env"
+# ---------- .env（关键！）----------
+info "写入环境变量文件：${INSTALL_DIR}/.env"
 cat > "${INSTALL_DIR}/.env" <<EOF
 PANEL_HOST=0.0.0.0
 PANEL_PORT=${PANEL_PORT}
 PANEL_FILE_ROOT=/
 EOF
 chmod 600 "${INSTALL_DIR}/.env"
-log "环境变量文件已创建。"
+log "环境变量文件已写入。"
 
-# =============================================================================
-#  9. 写入 systemd 服务（使用 EnvironmentFile 标准方式）
-# =============================================================================
+# ---------- systemd 服务（关键！EnvironmentFile 写法）----------
 info "创建 systemd 服务：${SERVICE_FILE}"
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -253,104 +159,79 @@ WantedBy=multi-user.target
 EOF
 log "systemd 服务文件已创建。"
 
-# =============================================================================
-#  10. 写入快捷管理命令 linux-panel
-# =============================================================================
+# ---------- linux-panel 命令 ----------
 info "创建快捷管理命令：/usr/local/bin/linux-panel"
 cat > /usr/local/bin/linux-panel <<'EOF'
 #!/usr/bin/env bash
 SERVICE="linux-panel"
-
 if [[ $EUID -ne 0 ]]; then
     echo "错误：linux-panel 必须以 root 身份运行。" >&2
     echo "请使用：sudo linux-panel $*" >&2
     exit 1
 fi
-
 case "${1:-}" in
-    start)
-        systemctl start "$SERVICE"
-        systemctl status "$SERVICE" --no-pager -l
-        ;;
-    stop)
-        systemctl stop "$SERVICE"
-        echo "已停止"
-        ;;
-    restart)
-        systemctl restart "$SERVICE"
-        systemctl status "$SERVICE" --no-pager -l
-        ;;
-    status)
-        systemctl status "$SERVICE" --no-pager -l
-        ;;
-    logs)
-        journalctl -u "$SERVICE" -f -n 100
-        ;;
-    pass)
-        journalctl -u "$SERVICE" -n 200 --no-pager | grep -A 6 "面板已初始化"
-        ;;
+    start)   systemctl start "$SERVICE"; systemctl status "$SERVICE" --no-pager -l ;;
+    stop)    systemctl stop "$SERVICE"; echo "已停止" ;;
+    restart) systemctl restart "$SERVICE"; systemctl status "$SERVICE" --no-pager -l ;;
+    status)  systemctl status "$SERVICE" --no-pager -l ;;
+    logs)    journalctl -u "$SERVICE" -f -n 100 ;;
+    pass)    journalctl -u "$SERVICE" -n 300 --no-pager | grep -A 6 "面板已初始化" ;;
     enable)
         mkdir -p /etc/systemd/system/multi-user.target.wants
         ln -sf /etc/systemd/system/${SERVICE}.service /etc/systemd/system/multi-user.target.wants/${SERVICE}.service
-        echo "已设置开机自启"
-        ;;
+        echo "已设置开机自启" ;;
     disable)
         rm -f /etc/systemd/system/multi-user.target.wants/${SERVICE}.service
-        echo "已取消开机自启"
-        ;;
+        echo "已取消开机自启" ;;
     uninstall)
         read -rp "确定要卸载 linux-panel 吗？[y/N] " ans
-        if [[ ! "$ans" =~ ^[Yy]$ ]]; then
-            echo "已取消"
-            exit 0
-        fi
+        [[ ! "$ans" =~ ^[Yy]$ ]] && { echo "已取消"; exit 0; }
         systemctl stop "$SERVICE" 2>/dev/null || true
         rm -f /etc/systemd/system/multi-user.target.wants/${SERVICE}.service
         rm -f /etc/systemd/system/${SERVICE}.service
         systemctl daemon-reload
         rm -f /usr/local/bin/linux-panel
-        echo "服务已卸载。"
-        echo "安装目录 /opt/linux-panel 未删除，如需删除请手动执行："
-        echo "  sudo rm -rf /opt/linux-panel"
-        ;;
-    *)
-        echo "用法: sudo linux-panel {start|stop|restart|status|logs|pass|enable|disable|uninstall}"
-        ;;
+        echo "服务已卸载。安装目录未删除，如需删除请手动执行："
+        echo "  sudo rm -rf /opt/linux-panel" ;;
+    *) echo "用法: sudo linux-panel {start|stop|restart|status|logs|pass|enable|disable|uninstall}" ;;
 esac
 EOF
 chmod 755 /usr/local/bin/linux-panel
 log "快捷管理命令已创建。"
 
-# =============================================================================
-#  11. 设置开机自启并启动服务
-# =============================================================================
-info "重新加载 systemd 并启动服务..."
+# ---------- 加载 + 开机自启 + 启动 ----------
+info "重新加载 systemd ..."
 systemctl daemon-reload || true
+sleep 1
 
-# 手动设置开机自启软链接（兼容性最好）
 mkdir -p /etc/systemd/system/multi-user.target.wants
 ln -sf "$SERVICE_FILE" "/etc/systemd/system/multi-user.target.wants/${SERVICE_NAME}.service"
 log "已设置开机自启。"
 
-# 记录启动时间，用于截取本次日志
 START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+STARTED=0
+for i in 1 2 3; do
+    info "启动服务（第 ${i} 次尝试）..."
+    systemctl start "$SERVICE_NAME" 2>/dev/null || true
+    sleep 4
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        STARTED=1
+        log "服务已成功启动并运行中！"
+        break
+    fi
+    warn "第 ${i} 次启动未成功，继续重试..."
+done
 
-# 启动服务（没有任何过滤，让 systemd 自己处理）
-systemctl start "$SERVICE" 2>&1 || warn "服务启动失败，请使用 'sudo linux-panel logs' 查看日志排查。"
-
-# 等待服务初始化并打印初始信息
-sleep 3
-
-# 检查服务是否真的在运行
-if systemctl is-active --quiet "$SERVICE"; then
-    log "服务已成功启动并运行中！"
+if [[ $STARTED -ne 1 ]]; then
+    err "服务启动失败，以下是最近 50 行日志："
+    echo "------------------------------------------------------------"
+    journalctl -u "$SERVICE_NAME" -n 50 --no-pager 2>/dev/null || true
+    echo "------------------------------------------------------------"
 else
-    err "服务启动失败，请运行 'sudo linux-panel logs' 查看具体报错。"
+    sleep 2
 fi
 
-# =============================================================================
-#  12. 完成提示 + 自动抓取本次启动的初始密码
-# =============================================================================
+# ---------- 完成提示 ----------
 echo
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}  Linux-Panel 安装完成！${NC}"
@@ -361,7 +242,6 @@ echo -e "  访问地址 : ${GREEN}http://<服务器IP>:${PANEL_PORT}${NC}"
 echo -e "  管理命令 : ${YELLOW}sudo linux-panel {start|stop|restart|status|logs|pass|uninstall}${NC}"
 echo
 
-# 只抓取本次启动后的日志，彻底解决重复显示历史密码的问题
 INIT_LOG=$(journalctl -u "$SERVICE_NAME" --since "$START_TIME" --no-pager 2>/dev/null | grep -A 6 "面板已初始化" || true)
 if [[ -n "$INIT_LOG" ]]; then
     echo -e "${YELLOW}  ─── 面板初始化信息 ───${NC}"
@@ -369,8 +249,8 @@ if [[ -n "$INIT_LOG" ]]; then
     echo
     echo -e "  ${YELLOW}请登录后立即修改密码！${NC}"
 else
-    warn "未在本次启动日志中找到“面板已初始化”信息。"
-    warn "可能数据库已存在（之前装过），请尝试运行：sudo linux-panel pass"
+    warn "本次启动日志中没有“面板已初始化”信息。"
+    warn "如忘记密码，请执行：sudo linux-panel pass"
 fi
 
 echo
