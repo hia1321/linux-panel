@@ -85,18 +85,18 @@ install_pkg_if_missing python3 python3
 install_pkg_if_missing pip3 python3-pip
 
 # =============================================================================
-#  3.1 关键修复：确保 venv 和 ensurepip 可用
+#  3.1 关键修复：确保 venv 和 ensurepip 可用（精简版，不装 python3-full）
 # =============================================================================
 if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || ! "$PYTHON_BIN" -m ensurepip --version >/dev/null 2>&1; then
     warn "检测到 python3-venv 或 ensurepip 缺失（Ubuntu/Debian 常见问题）。"
-    read -rp "是否自动安装 python3-venv / python3-full？[Y/n] " ans
+    read -rp "是否自动安装 python3-venv？[Y/n] " ans
     if [[ ! "${ans:-Y}" =~ ^[Nn]$ ]]; then
         apt-get update -qq
-        apt-get install -y python3-venv python3-pip python3-full || true
-        # 动态获取 Python 主版本号，例如 3.14
+        # 动态获取 Python 主版本号，例如 3.14，优先安装精确匹配的 venv
         PY_VER=$("$PYTHON_BIN" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')
-        apt-get install -y "${PY_VER}-venv" || true
-        log "已尝试安装 python3-venv 相关包。"
+        # 先尝试安装精确版本的 venv，失败则回退到通用包
+        apt-get install -y "${PY_VER}-venv" || apt-get install -y python3-venv || true
+        log "已安装 python3-venv 相关包。"
     else
         err "缺少 python3-venv，无法创建虚拟环境。"
         exit 1
@@ -105,11 +105,11 @@ fi
 
 # 二次确认 venv 是否真正可用
 if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
-    err "python3-venv 仍不可用，请手动执行：sudo apt install python3-venv python3-full"
+    err "python3-venv 仍不可用，请手动执行：sudo apt install python3-venv"
     exit 1
 fi
 if ! "$PYTHON_BIN" -m ensurepip --version >/dev/null 2>&1; then
-    err "ensurepip 仍不可用，请手动执行：sudo apt install python3-venv python3-full"
+    err "ensurepip 仍不可用，请手动执行：sudo apt install python3-venv"
     exit 1
 fi
 
@@ -149,8 +149,7 @@ cd "$INSTALL_DIR"
 # =============================================================================
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
     info "创建 Python 虚拟环境 ${VENV_DIR} ..."
-    # 删除可能残留的失败目录
-    rm -rf "$VENV_DIR"
+    rm -rf "$VENV_DIR" # 清理可能的失败残留
     if ! "$PYTHON_BIN" -m venv "$VENV_DIR"; then
         err "创建虚拟环境失败，请检查 python3-venv 是否安装正确。"
         exit 1
