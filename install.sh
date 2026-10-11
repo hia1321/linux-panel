@@ -2,10 +2,10 @@
 # =============================================================================
 #  Linux-Panel 一键安装脚本
 #  强制以 root 身份安装和运行
+#  默认端口：33972
 #  适用系统：Debian / Ubuntu 系
 #  仓库地址：https://github.com/hia1321/linux-panel
 # =============================================================================
-set -euo pipefail
 
 # ----------------------------- 基本配置 -------------------------------------
 REPO_URL="https://github.com/hia1321/linux-panel.git"
@@ -14,7 +14,7 @@ SERVICE_NAME="linux-panel"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 PYTHON_BIN="/usr/bin/python3"
 VENV_DIR="${INSTALL_DIR}/venv"
-PANEL_PORT="${PANEL_PORT:-8888}"
+PANEL_PORT="${PANEL_PORT:-33972}"
 
 # ----------------------------- 颜色输出 -------------------------------------
 RED='\033[0;31m'
@@ -45,7 +45,7 @@ fi
 log "已确认以 root 身份运行，继续安装..."
 
 # =============================================================================
-#  2. 系统检测：只支持 Debian / Ubuntu 系
+#  2. 系统检测
 # =============================================================================
 if ! command -v apt-get >/dev/null 2>&1; then
     err "本脚本目前仅支持 Debian / Ubuntu 系系统。"
@@ -68,8 +68,8 @@ install_pkg_if_missing() {
         read -rp "是否安装 ${pkg}？[Y/n] " ans
         if [[ ! "${ans:-Y}" =~ ^[Nn]$ ]]; then
             apt-get update -qq
-            apt-get install -y "$pkg"
-            log "已安装 ${pkg}"
+            apt-get install -y "$pkg" || true
+            log "已尝试安装 ${pkg}"
         else
             err "缺少 ${cmd}，无法继续。"
             exit 1
@@ -85,40 +85,21 @@ install_pkg_if_missing python3 python3
 install_pkg_if_missing pip3 python3-pip
 
 # =============================================================================
-#  3.1 关键修复：确保 venv 和 ensurepip 可用（精简版，不装 python3-full）
+#  3.1 关键修复：确保 venv 和 ensurepip 可用（精简版）
 # =============================================================================
 if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || ! "$PYTHON_BIN" -m ensurepip --version >/dev/null 2>&1; then
     warn "检测到 python3-venv 或 ensurepip 缺失（Ubuntu/Debian 常见问题）。"
     read -rp "是否自动安装 python3-venv？[Y/n] " ans
     if [[ ! "${ans:-Y}" =~ ^[Nn]$ ]]; then
         apt-get update -qq
-        # 动态获取 Python 主版本号，例如 3.14，优先安装精确匹配的 venv
         PY_VER=$("$PYTHON_BIN" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')
-        # 先尝试安装精确版本的 venv，失败则回退到通用包
         apt-get install -y "${PY_VER}-venv" || apt-get install -y python3-venv || true
-        log "已安装 python3-venv 相关包。"
+        log "已尝试安装 python3-venv 相关包。"
     else
         err "缺少 python3-venv，无法创建虚拟环境。"
         exit 1
     fi
 fi
-
-# 二次确认 venv 是否真正可用
-if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
-    err "python3-venv 仍不可用，请手动执行：sudo apt install python3-venv"
-    exit 1
-fi
-if ! "$PYTHON_BIN" -m ensurepip --version >/dev/null 2>&1; then
-    err "ensurepip 仍不可用，请手动执行：sudo apt install python3-venv"
-    exit 1
-fi
-
-# 检测可选命令（不阻塞安装）
-for opt in ssh-keygen ufw sshd; do
-    if ! command -v "$opt" >/dev/null 2>&1; then
-        warn "未检测到 ${opt}，面板对应功能可能不可用。"
-    fi
-done
 
 # =============================================================================
 #  4. 克隆 / 更新仓库到 /opt/linux-panel
@@ -126,11 +107,7 @@ done
 if [[ -d "$INSTALL_DIR" ]]; then
     if [[ -d "${INSTALL_DIR}/.git" ]]; then
         info "目录 ${INSTALL_DIR} 已存在，执行 git pull 更新..."
-        if ! git -C "$INSTALL_DIR" pull --ff-only; then
-            err "git pull 失败，请检查网络或手动处理冲突。"
-            exit 1
-        fi
-        log "代码已更新到最新版本。"
+        git -C "$INSTALL_DIR" pull --ff-only || warn "git pull 失败，跳过更新，继续安装。"
     else
         err "${INSTALL_DIR} 已存在，但不是 git 仓库。"
         err "请手动删除后再运行本脚本：sudo rm -rf ${INSTALL_DIR}"
@@ -138,18 +115,21 @@ if [[ -d "$INSTALL_DIR" ]]; then
     fi
 else
     info "克隆仓库到 ${INSTALL_DIR} ..."
-    git clone "$REPO_URL" "$INSTALL_DIR"
+    if ! git clone "$REPO_URL" "$INSTALL_DIR"; then
+        err "克隆仓库失败，请检查网络。"
+        exit 1
+    fi
     log "仓库克隆完成。"
 fi
 
-cd "$INSTALL_DIR"
+cd "$INSTALL_DIR" || exit 1
 
 # =============================================================================
 #  5. 创建虚拟环境
 # =============================================================================
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
     info "创建 Python 虚拟环境 ${VENV_DIR} ..."
-    rm -rf "$VENV_DIR" # 清理可能的失败残留
+    rm -rf "$VENV_DIR"
     if ! "$PYTHON_BIN" -m venv "$VENV_DIR"; then
         err "创建虚拟环境失败，请检查 python3-venv 是否安装正确。"
         exit 1
@@ -169,36 +149,35 @@ if [[ -f requirements.txt ]]; then
     read -rp "是否安装/更新 requirements.txt 中的 Python 依赖？[Y/n] " ans
     if [[ ! "${ans:-Y}" =~ ^[Nn]$ ]]; then
         info "安装 Python 依赖..."
-        "$VENV_PIP" install --upgrade pip
-        "$VENV_PIP" install -r requirements.txt
-        log "Python 依赖安装完成。"
+        "$VENV_PIP" install --upgrade pip || warn "pip 升级失败，使用现有版本。"
+        "$VENV_PIP" install -r requirements.txt || warn "部分依赖安装失败，服务可能无法启动。"
+        log "Python 依赖处理完成。"
     else
-        warn "已跳过依赖安装，请确保 venv 中已有依赖，否则服务无法启动。"
+        warn "已跳过依赖安装。"
     fi
 else
     warn "未找到 requirements.txt，跳过依赖安装。"
 fi
 
 # =============================================================================
-#  7. 目录权限收紧（仅 root 可访问）
+#  7. 目录权限收紧
 # =============================================================================
 info "设置安装目录权限为 root:root 700 ..."
-chown -R root:root "$INSTALL_DIR"
-chmod 700 "$INSTALL_DIR"
-
+chown -R root:root "$INSTALL_DIR" || true
+chmod 700 "$INSTALL_DIR" || true
 if [[ -d "${INSTALL_DIR}/data" ]]; then
-    chmod 700 "${INSTALL_DIR}/data"
+    chmod 700 "${INSTALL_DIR}/data" || true
 fi
 if [[ -f "${INSTALL_DIR}/data/secret.key" ]]; then
-    chmod 600 "${INSTALL_DIR}/data/secret.key"
+    chmod 600 "${INSTALL_DIR}/data/secret.key" || true
 fi
 if [[ -f "${INSTALL_DIR}/data/panel.db" ]]; then
-    chmod 600 "${INSTALL_DIR}/data/panel.db"
+    chmod 600 "${INSTALL_DIR}/data/panel.db" || true
 fi
 log "目录权限已收紧。"
 
 # =============================================================================
-#  8. 写入 systemd 服务（固定 root 身份）
+#  8. 写入 systemd 服务
 # =============================================================================
 info "创建 systemd 服务：${SERVICE_FILE}"
 cat > "$SERVICE_FILE" <<EOF
@@ -226,12 +205,11 @@ EOF
 log "systemd 服务文件已创建。"
 
 # =============================================================================
-#  9. 写入快捷管理命令 linux-panel（同样强制 root）
+#  9. 写入快捷管理命令 linux-panel
 # =============================================================================
 info "创建快捷管理命令：/usr/local/bin/linux-panel"
 cat > /usr/local/bin/linux-panel <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
 SERVICE="linux-panel"
 
 if [[ $EUID -ne 0 ]]; then
@@ -288,12 +266,14 @@ chmod 755 /usr/local/bin/linux-panel
 log "快捷管理命令已创建。"
 
 # =============================================================================
-#  10. 启动服务
+#  10. 启动服务（强制报错不退出，保证有提示）
 # =============================================================================
 info "重新加载 systemd 并启动服务..."
-systemctl daemon-reload
-systemctl enable --now "$SERVICE"
-log "服务已启动并设置为开机自启。"
+systemctl daemon-reload || true
+# 先设置开机自启
+systemctl enable "$SERVICE" >/dev/null 2>&1 || warn "设置开机自启失败，请检查 systemd 状态。"
+# 再启动一次
+systemctl start "$SERVICE" || warn "服务启动失败，请使用 'sudo linux-panel logs' 查看日志排查。"
 
 # =============================================================================
 #  11. 完成提示
