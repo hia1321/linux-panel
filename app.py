@@ -1,6 +1,7 @@
 import base64, errno, fcntl, hashlib, hmac, io, logging, os, pty, re, secrets
 import select, shutil, signal, socket as pysocket, sqlite3, stat, struct
 import subprocess, tarfile, tempfile, termios, threading, time, zipfile
+import sys
 from datetime import datetime
 from functools import wraps
 from logging.handlers import RotatingFileHandler
