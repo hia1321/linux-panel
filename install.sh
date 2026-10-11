@@ -49,13 +49,11 @@ log "已确认以 root 身份运行，继续安装..."
 # =============================================================================
 if ! command -v apt-get >/dev/null 2>&1; then
     err "本脚本目前仅支持 Debian / Ubuntu 系系统。"
-    err "其他发行版请手动安装：见仓库 README。"
     exit 1
 fi
 
 if [[ ! -d /run/systemd/system ]]; then
     err "未检测到 systemd，本脚本依赖 systemd 管理服务。"
-    err "如为 WSL / 容器环境，请手动启动 app.py。"
     exit 1
 fi
 
@@ -86,18 +84,33 @@ install_pkg_if_missing git git
 install_pkg_if_missing python3 python3
 install_pkg_if_missing pip3 python3-pip
 
-# python3-venv 是 Ubuntu 上常见的缺失模块
-if ! "$PYTHON_BIN" -c "import venv" >/dev/null 2>&1; then
-    warn "python3-venv 模块不可用。"
-    read -rp "是否安装 python3-venv？[Y/n] " ans
+# =============================================================================
+#  3.1 关键修复：确保 venv 和 ensurepip 可用
+# =============================================================================
+if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || ! "$PYTHON_BIN" -m ensurepip --version >/dev/null 2>&1; then
+    warn "检测到 python3-venv 或 ensurepip 缺失（Ubuntu/Debian 常见问题）。"
+    read -rp "是否自动安装 python3-venv / python3-full？[Y/n] " ans
     if [[ ! "${ans:-Y}" =~ ^[Nn]$ ]]; then
         apt-get update -qq
-        apt-get install -y python3-venv
-        log "已安装 python3-venv"
+        apt-get install -y python3-venv python3-pip python3-full || true
+        # 动态获取 Python 主版本号，例如 3.14
+        PY_VER=$("$PYTHON_BIN" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')
+        apt-get install -y "${PY_VER}-venv" || true
+        log "已尝试安装 python3-venv 相关包。"
     else
         err "缺少 python3-venv，无法创建虚拟环境。"
         exit 1
     fi
+fi
+
+# 二次确认 venv 是否真正可用
+if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
+    err "python3-venv 仍不可用，请手动执行：sudo apt install python3-venv python3-full"
+    exit 1
+fi
+if ! "$PYTHON_BIN" -m ensurepip --version >/dev/null 2>&1; then
+    err "ensurepip 仍不可用，请手动执行：sudo apt install python3-venv python3-full"
+    exit 1
 fi
 
 # 检测可选命令（不阻塞安装）
@@ -136,7 +149,12 @@ cd "$INSTALL_DIR"
 # =============================================================================
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
     info "创建 Python 虚拟环境 ${VENV_DIR} ..."
-    "$PYTHON_BIN" -m venv "$VENV_DIR"
+    # 删除可能残留的失败目录
+    rm -rf "$VENV_DIR"
+    if ! "$PYTHON_BIN" -m venv "$VENV_DIR"; then
+        err "创建虚拟环境失败，请检查 python3-venv 是否安装正确。"
+        exit 1
+    fi
     log "虚拟环境创建完成。"
 else
     log "虚拟环境已存在，跳过创建。"
@@ -259,7 +277,7 @@ case "${1:-}" in
         systemctl daemon-reload
         rm -f /usr/local/bin/linux-panel
         echo "服务已卸载。"
-        echo "安装目录 ${INSTALL_DIR:-/opt/linux-panel} 未删除，如需删除请手动执行："
+        echo "安装目录 /opt/linux-panel 未删除，如需删除请手动执行："
         echo "  sudo rm -rf /opt/linux-panel"
         ;;
     *)
