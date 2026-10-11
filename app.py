@@ -4266,9 +4266,21 @@ refreshBitsOptions();
 # ============================================================================
 # 启动
 # ============================================================================
-def check_root():
+def require_root():
+    """强制要求以 root 身份运行，否则立即退出。"""
     if os.geteuid() != 0:
-        print("\n⚠️  建议使用 root 运行：sudo python3 app.py\n")
+        bar = "=" * 64
+        print(f"\n{bar}")
+        print("  ✗ 错误：linux-panel 只能以 root 身份运行")
+        print(f"{bar}")
+        print("  请使用以下方式之一启动：")
+        print("    1) 安装为系统服务（推荐）：")
+        print("         sudo bash install.sh")
+        print("         sudo linux-panel start")
+        print("    2) 临时以 root 运行：")
+        print("         sudo python3 app.py")
+        print(f"{bar}\n")
+        sys.exit(1)
 
 def check_ufw():
     if not ufw_available():
@@ -4276,8 +4288,8 @@ def check_ufw():
         print("   安装：sudo apt install -y ufw\n")
 
 if __name__ == "__main__":
+    require_root()          # 必须在最前面，其他初始化之前
     print("\n面板启动中…")
-    check_root()
     check_ufw()
     print(f"📡 http://{HOST}:{PORT}")
     print(f"📂 文件根目录: {FILE_ROOT}")
