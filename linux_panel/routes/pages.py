@@ -1,0 +1,25 @@
+from flask import Blueprint, make_response
+from ..core import *
+from flask import render_template
+
+
+bp = Blueprint("pages", __name__)
+
+@bp.route("/")
+@bp.route("/files")
+@bp.route("/ssh")
+@bp.route("/terminal")
+@bp.route("/cron")
+@bp.route("/firewall")
+@bp.route("/docker")
+@bp.route("/dns")
+@bp.route("/ssl")
+@login_required
+def index():
+    # The panel is updated through GitHub/install.sh. Avoid stale HTML/JS from
+    # the browser cache after deploying a new version of the UI.
+    response = make_response(render_template("index.html"))
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
